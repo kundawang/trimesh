@@ -3158,6 +3158,35 @@ class Trimesh(Geometry3D):
         """
         return self.ray.contains_points(points)
 
+    def clip_polyline(self, polyline: ArrayLike) -> list[NDArray[float64]]:
+        """
+        Clip a finite polyline against the mesh, returning the portions
+        of the polyline that lie inside the mesh.
+
+        This inserts exact triangle intersection points at every entry
+        and exit, rather than filtering sampled points, so segments
+        crossing the surface between two samples are handled precisely.
+        The mesh must be watertight.
+
+        Parameters
+        ------------
+        polyline : (n, 3) float
+          Ordered vertices of a single finite polyline.
+
+        Returns
+        ---------
+        inside : list of (m, 3) float
+          Maximal inside runs of the polyline, each ordered along the
+          original polyline. Runs on adjacent segments are joined at
+          shared vertices. Empty when nothing is inside.
+
+        Raises
+        -------
+        ValueError
+          If the mesh is not watertight or the polyline is not (n, 3).
+        """
+        return intersections.clip_polyline(self, polyline)
+
     @cache_decorator
     def face_angles(self) -> NDArray[float64]:
         """

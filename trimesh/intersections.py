@@ -12,6 +12,7 @@ from . import transformations as tf
 from . import triangles as tm
 from .constants import tol
 from .triangles import points_to_barycentric
+from .typed import ArrayLike, NDArray
 
 
 def mesh_plane(
@@ -803,3 +804,359 @@ def slice_mesh_plane(
 
     # return the sliced mesh
     return Trimesh(vertices=vertices, faces=faces, visual=visual, **kwargs)
+
+
+def _segment_candidate_faces(mesh, a, b):
+    """
+    Find the indexes of faces whose axis aligned bounds intersect
+    the bounding box of a single line segment.
+
+    Parameters
+    -----------
+    mesh : trimesh.Trimesh
+      Mesh to query against.
+    a : (3,) float
+      Start point of the segment.
+    b : (3,) float
+      End point of the segment.
+
+    Returns
+    --------
+    face_index : (m,) int64
+      Candidate face indexes.
+    """
+    box = np.concatenate((np.minimum(a, b), np.maximum(a, b)))
+    # pad by the merge tolerance so tangency cases are not culled
+    box[:3] -= tol.merge
+    box[3:] += tol.merge
+    return np.fromiter(mesh.triangles_tree.intersection(box), dtype=np.int64)
+
+
+def _segment_triangle_hits(triangles, face_normals, a, b):
+    """
+    Intersect a single finite line segment against a group of
+    triangles, returning transversal hits and coplanar overlap.
+
+    Parameters
+    -----------
+    triangles : (n, 3, 3) float
+      Candidate triangles in space.
+    face_normals : (n, 3) float
+      Unit normals of the candidate triangles.
+    a : (3,) float
+      Segment start point.
+    b : (3,) float
+      Segment end point.
+
+    Returns
+    --------
+    hit_t : (h,) float
+      Parameter values in ``[0, 1]`` of transversal intersections
+      of the segment with triangle interiors, edges or vertices.
+      Multiple faces sharing an edge/vertex produce repeated values.
+    coplanar_t : (k, 2) float
+      ``[t_min, t_max]`` intervals of the segment lying in the plane
+      and inside each coplanar triangle.
+    """
+    direction = b - a
+    length = np.linalg.norm(direction)
+
+    # signed distance of the segment endpoints to each triangle plane
+    rel = a - triangles[:, 0, :]
+    d0 = util.diagonal_dot(rel, face_normals)
+    d1 = util.diagonal_dot(b - triangles[:, 0, :], face_normals)
+
+    eps = tol.merge
+    coplanar = np.abs(d0) <= eps
+    # a segment is parallel to a plane only when both endpoints are
+    coplanar &= np.abs(d1) <= eps
+    crossing = ~coplanar
+
+    hit_t = np.zeros(0, dtype=np.float64)
+    coplanar_t = np.zeros((0, 2), dtype=np.float64)
+
+    if crossing.any():
+        idx = np.flatnonzero(crossing)
+        # linear interpolation of the signed plane distance
+        denom = d1[idx] - d0[idx]
+        t = -d0[idx] / denom
+        inside = (t >= -tol.zero) & (t <= 1.0 + tol.zero)
+        idx = idx[inside]
+        t = np.clip(t[inside], 0.0, 1.0)
+        if len(idx) > 0:
+            points = a + t.reshape((-1, 1)) * direction
+            bary = points_to_barycentric(triangles[idx], points)
+            on_tri = (bary >= -tol.zero).all(axis=1) & (bary <= 1.0 + tol.zero).all(
+                axis=1
+            )
+            hit_t = t[on_tri]
+
+    if coplanar.any():
+        idx = np.flatnonzero(coplanar)
+        # barycentric coordinates are affine along the segment so the
+        # interval inside each triangle is the intersection of the three
+        # half-plane constraints on t
+        b0 = points_to_barycentric(triangles[idx], np.tile(a, (len(idx), 1)))
+        b1 = points_to_barycentric(triangles[idx], np.tile(b, (len(idx), 1)))
+        db = b1 - b0
+        lo = np.zeros(len(idx))
+        hi = np.ones(len(idx))
+        valid = np.ones(len(idx), dtype=bool)
+        for k in range(3):
+            flat = np.abs(db[:, k]) <= tol.zero
+            # constant coordinate must already satisfy the constraint
+            fails = flat & ((b0[:, k] < -tol.zero) | (b0[:, k] > 1.0 + tol.zero))
+            valid &= ~fails
+            slope = np.where(flat, 1.0, db[:, k])
+            root = -b0[:, k] / slope
+            rising = (~flat) & (db[:, k] > 0.0)
+            falling = (~flat) & (db[:, k] < 0.0)
+            lo = np.maximum(lo, np.where(rising, root, 0.0))
+            hi = np.minimum(hi, np.where(falling, root, 1.0))
+        valid &= hi >= lo - tol.zero
+        if valid.any():
+            lo = np.clip(lo[valid], 0.0, 1.0)
+            hi = np.clip(hi[valid], 0.0, 1.0)
+            keep = (hi - lo) * length > tol.merge
+            coplanar_t = np.column_stack((lo[keep], hi[keep]))
+
+    return hit_t, coplanar_t
+
+
+def _merge_t_intervals(intervals, tol_abs):
+    """
+    Merge overlapping ``[t_min, t_max]`` intervals on a single segment.
+
+    Parameters
+    -----------
+    intervals : (n, 2) float
+      Parameter intervals, unordered.
+    tol_abs : float
+      Gaps smaller than this are merged.
+
+    Returns
+    --------
+    merged : (m, 2) float
+      Sorted, disjoint intervals.
+    """
+    if len(intervals) == 0:
+        return np.zeros((0, 2), dtype=np.float64)
+    order = np.argsort(intervals[:, 0])
+    intervals = intervals[order]
+    merged = [intervals[0].copy()]
+    for lo, hi in intervals[1:]:
+        if lo <= merged[-1][1] + tol_abs:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append(np.array([lo, hi]))
+    return np.array(merged, dtype=np.float64)
+
+
+def _unique_t(values, tol_abs):
+    """
+    Sort and deduplicate parameter values that agree within a tolerance.
+
+    Parameters
+    -----------
+    values : (n,) float
+      Parameter values on a single segment.
+    tol_abs : float
+      Values closer than this are treated as the same event.
+
+    Returns
+    --------
+    unique : (m,) float
+      Sorted, deduplicated values, each clipped to ``[0, 1]``.
+    """
+    if len(values) == 0:
+        return np.zeros(0, dtype=np.float64)
+    values = np.sort(np.clip(np.asanyarray(values, dtype=np.float64), 0.0, 1.0))
+    unique = [values[0]]
+    for v in values[1:]:
+        if v - unique[-1] > tol_abs:
+            unique.append(v)
+        else:
+            # keep the value closest to 0 or 1 when an event lands on
+            # an endpoint, otherwise retain the existing estimate
+            if abs(v - 0.0) < abs(unique[-1] - 0.0) or abs(v - 1.0) < abs(
+                unique[-1] - 1.0
+            ):
+                unique[-1] = v
+    return np.array(unique, dtype=np.float64)
+
+
+def clip_polyline(mesh, polyline: ArrayLike) -> list[NDArray[np.float64]]:
+    """
+    Clip a finite polyline against a closed watertight mesh, returning
+    the portions of the polyline that lie inside the mesh.
+
+    Unlike filtering sampled points with :meth:`Trimesh.contains`, this
+    inserts exact triangle intersection points at every entry and exit,
+    so segments crossing the surface between two samples are clipped
+    precisely. Tangencies (the line only touches an edge or vertex) do
+    not create spurious inside runs, multiple entries and exits are all
+    returned, and segments lying entirely inside are kept whole.
+
+    Parameters
+    -----------
+    mesh : trimesh.Trimesh
+      Closed, watertight mesh defining the inside region. Points on the
+      surface are treated as inside (a closed set).
+    polyline : (n, 3) float
+      Ordered vertices of a single finite polyline. Zero-length segments
+      (consecutive duplicate points) are skipped.
+
+    Returns
+    --------
+    inside : list of (m, 3) float
+      The inside portions of the polyline as ordered point lists. Each
+      array is one maximal inside run; consecutive input segments whose
+      junction stays inside are joined into a single run, and every run
+      starts and ends either at an exact surface intersection point or
+      at an original polyline vertex. An empty list is returned when
+      nothing is inside.
+
+    Raises
+    -------
+    ValueError
+      If ``mesh`` is not watertight (open or non-manifold meshes do not
+      define an inside/outside classification) or the polyline is not
+      shaped ``(n, 3)``.
+    """
+    polyline = np.asanyarray(polyline, dtype=np.float64)
+    if not util.is_shape(polyline, (-1, 3)):
+        raise ValueError("polyline must be (n, 3) points")
+    if not bool(getattr(mesh, "is_watertight", False)):
+        raise ValueError(
+            "mesh must be watertight to clip a polyline: open or non-manifold meshes do not define an inside region"
+        )
+    if len(polyline) < 2:
+        return []
+
+    triangles = mesh.triangles
+    normals = mesh.face_normals
+
+    # one inside run is built up across consecutive segments
+    runs: list[NDArray[np.float64]] = []
+    current: list[np.ndarray] = []
+    # whether the previous segment was inside at its end vertex,
+    # i.e. at the junction with the current segment
+    prev_end_inside = False
+
+    for seg_index in range(len(polyline) - 1):
+        a = polyline[seg_index]
+        b = polyline[seg_index + 1]
+        direction = b - a
+        length = np.linalg.norm(direction)
+
+        if length <= tol.merge:
+            # zero-length segment: a single point. it joins a run when it
+            # is inside; a point outside closes any run in progress
+            point_inside = bool(mesh.contains(a.reshape((1, 3)))[0])
+            if point_inside:
+                current.append(a.copy())
+            elif len(current) > 0:
+                runs.append(np.array(current))
+                current = []
+            prev_end_inside = point_inside
+            continue
+
+        # tolerance in parameter space, scaled to the segment length
+        tol_t = tol.merge / length
+
+        face_index = _segment_candidate_faces(mesh, a, b)
+        if len(face_index) == 0:
+            hit_t = np.zeros(0, dtype=np.float64)
+            coplanar_t = np.zeros((0, 2), dtype=np.float64)
+        else:
+            hit_t, coplanar_t = _segment_triangle_hits(
+                triangles[face_index], normals[face_index], a, b
+            )
+
+        # portions lying on coplanar faces are inside by convention
+        surface = _merge_t_intervals(coplanar_t, tol_t)
+
+        # partition the segment at every transversal surface event
+        events = _unique_t(hit_t, tol_t)
+        cuts = np.concatenate(([0.0], events, [1.0]))
+        cuts = _unique_t(cuts, tol_t)
+
+        # classify every open interval from its midpoint in a single
+        # batched contains query; tangencies partition nothing because
+        # the intervals on both sides receive the same classification
+        if len(cuts) >= 2:
+            mids = 0.5 * (cuts[:-1] + cuts[1:])
+            midpoints = a + mids.reshape((-1, 1)) * direction
+            inside_mid = mesh.contains(midpoints)
+        else:
+            inside_mid = np.zeros(0, dtype=bool)
+
+        # force intervals covered by coplanar faces to be inside
+        for lo, hi in surface:
+            for j in range(len(cuts) - 1):
+                mid = 0.5 * (cuts[j] + cuts[j + 1])
+                if lo - tol_t <= mid <= hi + tol_t:
+                    inside_mid[j] = True
+
+        # tangencies need no special handling: the intervals on both
+        # sides of a tangent event get the same midpoint classification,
+        # and exact event points are attached to inside runs below
+
+        # junction state is read from the interval adjacent to each
+        # endpoint: an entry event exactly at t=0 still leaves the first
+        # interval outside, so the junction itself is not inside
+        start_inside = len(inside_mid) > 0 and bool(inside_mid[0])
+        end_inside = len(inside_mid) > 0 and bool(inside_mid[-1])
+
+        # collect each maximal inside piece of this segment separately:
+        # a segment crossing the surface multiple times yields several
+        pieces: list[list[np.ndarray]] = []
+        current_piece: list[np.ndarray] = []
+        for j in range(len(cuts) - 1):
+            if not inside_mid[j]:
+                if len(current_piece) > 0:
+                    pieces.append(current_piece)
+                    current_piece = []
+                continue
+            t0, t1 = cuts[j], cuts[j + 1]
+            p0 = a if t0 <= tol_t else a + t0 * direction
+            p1 = b if t1 >= 1.0 - tol_t else a + t1 * direction
+            if len(current_piece) == 0:
+                current_piece.append(p0)
+            current_piece.append(p1)
+        if len(current_piece) > 0:
+            pieces.append(current_piece)
+
+        if len(pieces) == 0:
+            # segment is fully outside: close any run in progress
+            if len(current) > 0:
+                runs.append(np.array(current))
+                current = []
+            prev_end_inside = False
+            continue
+
+        for piece_index, piece in enumerate(pieces):
+            piece_starts_inside = piece_index == 0 and start_inside
+            if len(current) > 0 and prev_end_inside and piece_starts_inside:
+                # both adjacent segments are inside at their shared
+                # vertex: drop the duplicate junction and extend the run
+                current.extend(piece[1:])
+            else:
+                # junction outside (or no run in progress): start fresh
+                if len(current) > 0:
+                    runs.append(np.array(current))
+                current = list(piece)
+            # only the first piece can touch the incoming junction; any
+            # later piece starts after an outside gap so its incoming end
+            # is an interior surface event, not a shared vertex
+            prev_end_inside = False
+        # the final piece reaches the segment end vertex iff the last
+        # interval was inside
+        prev_end_inside = end_inside
+
+    if len(current) > 0:
+        runs.append(np.array(current))
+
+    # an isolated tangency collapses to a single point: discard it, as
+    # a point-only contact carries no inside portion of the polyline
+    return [run for run in runs if len(run) >= 2]
