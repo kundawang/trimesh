@@ -287,6 +287,102 @@ class GroupTests(g.unittest.TestCase):
         # even though faces are wrong
         mesh.merge_vertices()
 
+    def test_merge_vertices_respects_colors(self):
+        red = g.np.array([255, 0, 0, 255], dtype=g.np.uint8)
+        green = g.np.array([0, 255, 0, 255], dtype=g.np.uint8)
+
+        # two coincident triangles with distinct per-vertex colors
+        tri = g.np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=g.np.float64)
+        vertices = g.np.vstack((tri, tri))
+        faces = g.np.array([[0, 1, 2], [3, 4, 5]], dtype=g.np.int64)
+        colors = g.np.vstack((g.np.tile(red, (3, 1)), g.np.tile(green, (3, 1))))
+
+        # processing must keep the red/green color boundary:
+        # coincident vertices with different colors stay separate
+        mesh = g.trimesh.Trimesh(
+            vertices=vertices, faces=faces, vertex_colors=colors, process=True
+        )
+        assert len(mesh.vertices) == 6
+        assert mesh.visual.vertex_colors.shape == (6, 4)
+
+        # face indices and colors stay in correspondence
+        face_colors = mesh.visual.face_colors
+        assert (face_colors[0] == red).all()
+        assert (face_colors[1] == green).all()
+        for face, expected in zip(mesh.faces, (red, green)):
+            assert (mesh.visual.vertex_colors[face] == expected).all()
+
+        # the boundary survives an export round-trip
+        roundtrip = g.trimesh.load(
+            g.trimesh.util.wrap_as_stream(mesh.export(file_type="ply")),
+            file_type="ply",
+            process=False,
+        )
+        assert len(roundtrip.vertices) == 6
+        rt_colors = roundtrip.visual.face_colors
+        assert (rt_colors[0] == red).all()
+        assert (rt_colors[1] == green).all()
+
+        # identical position *and* color still deduplicate
+        same = g.trimesh.Trimesh(
+            vertices=vertices,
+            faces=faces,
+            vertex_colors=g.np.tile(red, (6, 1)),
+            process=True,
+        )
+        assert len(same.vertices) == 3
+        assert (same.visual.vertex_colors == red).all()
+
+        # a third red layer merges with the first but not the green one
+        vertices3 = g.np.vstack((tri, tri, tri))
+        faces3 = g.np.array(
+            [[0, 1, 2], [3, 4, 5], [6, 7, 8]], dtype=g.np.int64
+        )
+        colors3 = g.np.vstack(
+            (g.np.tile(red, (3, 1)), g.np.tile(green, (3, 1)), g.np.tile(red, (3, 1)))
+        )
+        mixed = g.trimesh.Trimesh(
+            vertices=vertices3, faces=faces3, vertex_colors=colors3, process=True
+        )
+        assert len(mixed.vertices) == 6
+
+        # colorless and face-colored meshes keep position-only merging
+        plain = g.trimesh.Trimesh(vertices=vertices, faces=faces, process=True)
+        assert len(plain.vertices) == 3
+
+        face_only = g.trimesh.Trimesh(
+            vertices=vertices,
+            faces=faces,
+            face_colors=g.np.vstack((red, green)),
+            process=True,
+        )
+        assert len(face_only.vertices) == 3
+        assert (face_only.visual.face_colors[0] == red).all()
+        assert (face_only.visual.face_colors[1] == green).all()
+
+        # different alpha values also keep vertices separate
+        translucent = g.trimesh.Trimesh(
+            vertices=vertices,
+            faces=faces,
+            vertex_colors=g.np.vstack(
+                (
+                    g.np.tile([255, 0, 0, 255], (3, 1)),
+                    g.np.tile([255, 0, 0, 128], (3, 1)),
+                )
+            ).astype(g.np.uint8),
+            process=True,
+        )
+        assert len(translucent.vertices) == 6
+
+        # a color array whose length does not match the vertices must
+        # raise instead of silently misaligning faces and colors
+        broken = g.trimesh.Trimesh(
+            vertices=vertices, faces=faces, process=False
+        )
+        broken.visual._data["vertex_colors"] = g.np.tile(red, (5, 1))
+        with self.assertRaises(ValueError):
+            broken.merge_vertices()
+
     def test_unique_ordered(self):
         a = g.np.array(
             [9, 9, 9, 8, 8, 7, 7, 6, 6, 5, 5, 4, 4, 3, 3, 0, 2, 1, 1, 0, 0, -1, -1, -1],

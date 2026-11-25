@@ -33,6 +33,12 @@ def merge_vertices(
     Removes duplicate vertices, grouped by position and
     optionally texture coordinate and normal.
 
+    Vertices with explicit per-vertex colors are additionally
+    grouped by their RGBA color: coincident vertices with
+    different colors are kept separate so color boundaries are
+    preserved, while duplicates identical in both position and
+    color are still merged.
+
     Parameters
     -------------
     mesh : Trimesh object
@@ -76,6 +82,24 @@ def merge_vertices(
 
     # collect vertex attributes into sequence we can stack
     stacked = [mesh.vertices * (10**digits_vertex)]
+
+    # explicit per-vertex colors are part of the vertex identity:
+    # coincident vertices with different RGBA values must stay
+    # separate to preserve color boundaries.
+    if (
+        mesh.visual.defined
+        and mesh.visual.kind == "vertex"
+        and "vertex_colors" in mesh.visual._data
+    ):
+        colors = np.asanyarray(mesh.visual.vertex_colors)
+        if len(colors) != len(mesh.vertices):
+            raise ValueError(
+                "vertex colors length "
+                f"{len(colors)} does not match vertex count "
+                f"{len(mesh.vertices)}: refusing to merge vertices"
+            )
+        # RGBA channels are exact integer values, no rounding
+        stacked.append(colors.astype(np.int64))
 
     # UV texture visuals require us to update the
     # vertices and normals differently
