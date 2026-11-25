@@ -2502,6 +2502,8 @@ class Trimesh(Geometry3D):
         face_weight: NDArray[float64] | None = None,
         return_barycentric: bool = False,
         seed: Seed = None,
+        only_exposed: bool = False,
+        **kwargs,
     ):
         """
         Return random samples distributed across the
@@ -2522,6 +2524,9 @@ class Trimesh(Geometry3D):
           of each sampled point.
         seed : None or int
           Seed for deterministic results, otherwise OS entropy.
+        only_exposed : bool
+          If True only sample exposed faces, excluding hidden
+          internal/mated faces, see `sample.exposed_face_mask`.
 
         Returns
         ---------
@@ -2534,6 +2539,9 @@ class Trimesh(Geometry3D):
           Coordinates on `self.faces[face_index]`
           Returned only when return_barycentric is True
         """
+        # accept alternative keyword spellings of the exposed-only mode
+        only_exposed = sample._exposed_flag(only_exposed, kwargs)
+
         if return_barycentric:
             samples, index, barycentric = sample.sample_surface(
                 mesh=self,
@@ -2541,13 +2549,18 @@ class Trimesh(Geometry3D):
                 face_weight=face_weight,
                 return_barycentric=True,
                 seed=seed,
+                only_exposed=only_exposed,
             )
             if return_index:
                 return samples, index, barycentric
             return samples, barycentric
 
         samples, index = sample.sample_surface(
-            mesh=self, count=count, face_weight=face_weight, seed=seed
+            mesh=self,
+            count=count,
+            face_weight=face_weight,
+            seed=seed,
+            only_exposed=only_exposed,
         )
         if return_index:
             return samples, index
