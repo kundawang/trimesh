@@ -236,7 +236,180 @@ def points_to_marching_cubes(points, pitch=1.0):
     return mesh
 
 
-def multibox(centers, pitch=1.0, colors=None, remove_internal_faces=False):
+def _multibox_manifold(centers, pitch=1.0, colors=None):
+    """
+    Build an exact watertight manifold mesh of axis-aligned
+    uniform-pitch voxels.
+
+    Faces shared by face-adjacent voxels are removed and the
+    remaining boundary triangles are welded along their grid edges.
+    A grid edge shared by two boundary triangles is a normal
+    manifold edge and its corners merge. A grid edge where two
+    solids only touch along the edge (a "checkerboard" contact,
+    four boundary triangles) is welded per voxel instead, so voxels
+    that merely share an edge or a vertex keep independent closed
+    shells. The output therefore has no boundary edge incident on
+    fewer than two triangles (it never opens a hole) and every
+    ordinary edge is incident on exactly two triangles.
+
+    The occupied volume and the position of every exterior surface
+    are identical to the one-box-per-voxel representation.
+
+    Parameters
+    -----------
+    centers : (n, 3) float
+      Centers of the occupied voxels, which must lie on an
+      axis-aligned uniform lattice with spacing `pitch`.
+    pitch : float
+      Uniform edge length of a voxel.
+    colors : None, (3,) or (4,) or (n, 3) or (n, 4) float
+      Per-voxel colors, matching the semantics of `multibox`.
+
+    Returns
+    ---------
+    mesh : trimesh.Trimesh
+      Watertight mesh, possibly containing multiple disconnected
+      closed shells. Constructed with `process=False` so coincident
+      vertices belonging to different shells are not re-merged.
+    """
+    from .. import primitives
+    from ..base import Trimesh
+
+    centers = np.asanyarray(centers, dtype=np.float64)
+    pitch = float(pitch)
+
+    if len(centers) == 0:
+        return Trimesh()
+
+    # discrete lattice coordinates of every occupied voxel
+    coords = np.round(centers / pitch).astype(np.int64)
+    if not np.allclose(coords.astype(np.float64) * pitch, centers):
+        raise ValueError(
+            "manifold output requires axis-aligned, uniformly spaced voxel centers"
+        )
+    occupied = set(map(tuple, coords))
+
+    box = primitives.Box()
+    base_faces = np.asarray(box.faces, dtype=np.int64)
+    base_verts = np.asarray(box.vertices, dtype=np.float64)
+    # the 12 box triangles point along the six axis directions
+    base_normals = np.round(box.face_normals).astype(np.int64)
+
+    per_voxel_colors = None
+    if colors is not None:
+        colors = np.asarray(colors)
+        if colors.ndim == 1:
+            colors = np.repeat(colors[None], len(centers), axis=0)
+        per_voxel_colors = colors
+
+    # union-find over triangle-corner "slots": one slot is created
+    # for every corner of every retained boundary triangle
+    parent = []
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    # world-space position of the grid vertex each slot sits on
+    slot_positions = []
+    kept_colors = []
+    # every kept triangle as the list of its three slot indices
+    triangle_slots = []
+    # every grid edge incident on a kept triangle, mapped to the
+    # (slot at ordered endpoint 0, slot at ordered endpoint 1,
+    # owning voxel index) entries lying on it
+    edge_slots = {}
+
+    for voxel_index, (coord, center) in enumerate(zip(coords, centers)):
+        for face_index, normal in enumerate(base_normals):
+            if tuple(coord + normal) in occupied:
+                # face shared with a face-adjacent voxel: truly internal
+                continue
+
+            local = base_faces[face_index]
+            # integer key of each corner's grid vertex; a voxel at
+            # coordinate c spans grid vertices 2*c +/- 1
+            corner_keys = 2 * coord + (2 * base_verts[local]).astype(np.int64)
+            slots = []
+            for corner, _key in zip(base_verts[local], corner_keys):
+                slot = len(parent)
+                parent.append(slot)
+                slot_positions.append(center + corner * pitch)
+                slots.append(slot)
+            triangle_slots.append(slots)
+
+            if per_voxel_colors is not None:
+                kept_colors.append(per_voxel_colors[voxel_index])
+
+            # register the three triangle edges against their grid
+            # edge, keeping the endpoint slots ordered by grid key so
+            # entries sharing an edge always align at both endpoints
+            for a, b in ((0, 1), (1, 2), (2, 0)):
+                key_a = tuple(corner_keys[a])
+                key_b = tuple(corner_keys[b])
+                if key_a < key_b:
+                    grid_key = (key_a, key_b)
+                    entry = (slots[a], slots[b], voxel_index)
+                else:
+                    grid_key = (key_b, key_a)
+                    entry = (slots[b], slots[a], voxel_index)
+                edge_slots.setdefault(grid_key, []).append(entry)
+
+    # Weld the boundary triangles along their grid edges.
+    # A boundary grid edge carries either two or four boundary
+    # triangles (no other multiplicity is possible for the closed
+    # boundary of axis-aligned voxels):
+    # - two triangles bound the same local surface, so their
+    #   matching endpoint slots merge directly;
+    # - four triangles form an edge-only ("checkerboard") contact
+    #   where the two participating voxels are not face-adjacent;
+    #   the two triangles owned by each voxel are welded together
+    #   while the two independent closed shells stay separate.
+    for entries in edge_slots.values():
+        if len(entries) == 2:
+            first, second = entries
+            union(first[0], second[0])
+            union(first[1], second[1])
+        elif len(entries) == 4:
+            by_voxel = {}
+            for entry in entries:
+                by_voxel.setdefault(entry[2], []).append(entry)
+            for pair in by_voxel.values():
+                first, second = pair
+                union(first[0], second[0])
+                union(first[1], second[1])
+        else:  # pragma: no cover - impossible on a closed voxel boundary
+            raise RuntimeError(
+                f"unexpected grid-edge multiplicity {len(entries)}"
+            )
+
+    # collapse the union-find slots into unique output vertices
+    roots = np.array([find(i) for i in range(len(parent))], dtype=np.int64)
+    unique_roots, inverse = np.unique(roots, return_inverse=True)
+    vertices = np.array([slot_positions[r] for r in unique_roots], dtype=np.float64)
+    faces = inverse.reshape((-1, 3))
+
+    face_colors = None
+    if per_voxel_colors is not None:
+        face_colors = np.asarray(kept_colors)
+
+    # vertices are already unique per surface; skip the default global
+    # vertex merge which would re-join shells touching at an edge or
+    # vertex and re-introduce non-manifold contacts
+    return Trimesh(
+        vertices=vertices, faces=faces, face_colors=face_colors, process=False
+    )
+
+
+def multibox(centers, pitch=1.0, colors=None, remove_internal_faces=False,
+             manifold=False):
     """
     Return a Trimesh object with a box at every center.
 
@@ -252,6 +425,11 @@ def multibox(centers, pitch=1.0, colors=None, remove_internal_faces=False):
       Color of boxes
     remove_internal_faces : bool
       If True, removes internal faces shared between adjacent boxes
+    manifold : bool
+      If True, return an exact watertight manifold mesh for
+      axis-aligned uniformly spaced voxels: internal faces are
+      removed and voxels that only touch at an edge or vertex stay
+      independent closed shells. Implies internal face removal.
 
     Returns
     ---------
@@ -263,6 +441,11 @@ def multibox(centers, pitch=1.0, colors=None, remove_internal_faces=False):
 
     # get centers as numpy array
     centers = np.asanyarray(centers, dtype=np.float64)
+
+    if manifold:
+        return _multibox_manifold(
+            centers=centers, pitch=pitch, colors=colors
+        )
 
     # get a basic box
     b = primitives.Box()

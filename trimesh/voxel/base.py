@@ -297,7 +297,7 @@ class VoxelGrid(Geometry):
         """(n, 3) int array of sparse indices of occupied voxels."""
         return self.encoding.sparse_indices
 
-    def as_boxes(self, colors=None, **kwargs):
+    def as_boxes(self, colors=None, manifold=False, **kwargs):
         """
         A rough Trimesh representation of the voxels with a box
         for each filled voxel.
@@ -307,6 +307,14 @@ class VoxelGrid(Geometry):
         colors : None, (3,) or (4,) float or uint8
           (X, Y, Z, 3) or (X, Y, Z, 4) float or uint8
           Where matrix.shape == (X, Y, Z)
+        manifold : bool
+          If True, return an exact watertight manifold mesh for
+          axis-aligned, uniformly spaced voxels. Truly internal
+          faces are removed and voxels that only share an edge or a
+          vertex remain independent closed shells, so every edge is
+          incident on exactly two faces. The occupied volume and
+          exterior surface positions are unchanged. Defaults to
+          False, which keeps the one-box-per-voxel behavior.
 
         Returns
         ---------
@@ -329,7 +337,12 @@ class VoxelGrid(Geometry):
                 log.warning("colors incorrect shape!")
                 colors = None
 
-        mesh = ops.multibox(centers=self.sparse_indices.astype(float), colors=colors)
+        mesh = ops.multibox(
+            centers=self.sparse_indices.astype(float),
+            colors=colors,
+            manifold=manifold,
+            **kwargs,
+        )
 
         mesh = mesh.apply_transform(self.transform)
         return mesh
