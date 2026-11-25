@@ -183,6 +183,20 @@ def voxel_from_binvox(rle_data, shape, translate=None, scale=1.0, axis_order="xz
     """
     Factory for building from data associated with binvox files.
 
+    The binvox format stores a single scalar `scale` alongside an
+    integer `dim` per axis, so it can only represent voxel grids with
+    a uniform (isotropic) physical pitch. Non-cubic grids are fine: the
+    cell count may differ between axes while the pitch stays the same.
+
+    The header convention used here (identical for cubic grids to the
+    historical trimesh convention) is::
+
+        pitch = scale / (max(shape) - 1)
+
+    i.e. `scale` is the center-to-center distance spanned by the axis
+    with the most cells. Every axis then uses the same `pitch`, so the
+    physical extent of a non-cubic grid is `pitch * (shape - 1)`.
+
     Parameters
     ---------
     rle_data : numpy
@@ -190,12 +204,13 @@ def voxel_from_binvox(rle_data, shape, translate=None, scale=1.0, axis_order="xz
       values, or a `trimesh.rle.RunLengthEncoding` object.
       See `trimesh.rle` documentation for description of encoding
     shape : (3,) int
-      Shape of voxel grid.
+      Number of cells along each axis of the grid.
+      Need not be equal as long as the physical pitch is uniform.
     translate : (3,) float
       Translation of voxels
     scale : float
-      Length of entire voxel grid.
-    encoded_axes : iterable
+      Center-to-center distance spanned by the longest grid axis.
+    axis_order : iterable
       With values in ('x', 'y', 'z', 0, 1, 2),
       where x => 0, y => 1, z => 2
       denoting the order of axes in the encoded data. binvox by
@@ -207,31 +222,42 @@ def voxel_from_binvox(rle_data, shape, translate=None, scale=1.0, axis_order="xz
     result : VoxelGrid
       Loaded voxels
     """
-    # shape must be uniform else scale is ambiguous
     from .. import transformations
     from ..voxel import encoding as enc
     from ..voxel.base import VoxelGrid
+
+    shape = tuple(int(s) for s in np.asanyarray(shape))
+    if len(shape) != 3 or any(s < 1 for s in shape):
+        raise ValueError(f"shape must be 3 positive integers, got {shape!s}")
 
     if isinstance(rle_data, enc.RunLengthEncoding):
         encoding = rle_data
     else:
         encoding = enc.RunLengthEncoding(rle_data, dtype=bool)
 
-    # translate = np.asanyarray(translate) * scale)
-    # translate = [0, 0, 0]
+    if min(shape) < 2:
+        raise ValueError(
+            f"binvox grids need >= 2 cells per axis; got shape {shape!s}"
+        )
+
+    # the single binvox `scale` is referenced to the longest axis so
+    # that cubic grids keep their original `scale / (n - 1)` pitch
+    ref = int(np.argmax(shape))
+    pitch = scale / (shape[ref] - 1)
     transform = transformations.scale_and_translate(
-        scale=scale / (np.array(shape) - 1), translate=translate
+        scale=np.full(3, pitch), translate=translate
     )
 
     if axis_order == "xzy":
+        # the data is stored in `xzy` order but `shape` is in `xyz`
         perm = (0, 2, 1)
-        shape = tuple(shape[p] for p in perm)
-        encoding = encoding.reshape(shape).transpose(perm)
+        encoded_shape = tuple(shape[p] for p in perm)
+        encoding = encoding.reshape(encoded_shape).transpose(perm)
     elif axis_order is None or axis_order == "xyz":
         encoding = encoding.reshape(shape)
     else:
         raise ValueError(
-            "Invalid axis_order '%s': must be None, 'xyz' or 'xzy'", axis_order
+            f"Invalid axis_order '{axis_order}': must be None, 'xyz' or 'xzy'"
         )
 
     assert encoding.shape == shape
@@ -274,6 +300,19 @@ def export_binvox(voxel, axis_order="xzy"):
     """
     Export `trimesh.voxel.VoxelGrid` instance to bytes
 
+    The binvox format stores one scalar `scale` for all three axes, so
+    it can only represent voxel grids whose cells have a uniform
+    (isotropic) physical pitch. The number of cells per axis may differ
+    (e.g. a 3x4x5 grid of identical cubes is valid); only genuinely
+    anisotropic pitches, or transforms with rotation/shear, cannot be
+    represented and raise a `ValueError` instead of being silently
+    distorted.
+
+    The written `scale` is the center-to-center distance along the
+    axis with the most cells, i.e. `pitch * (max(shape) - 1)`, which
+    matches the convention used by `voxel_from_binvox` and preserves
+    the historical convention for cubic grids.
+
     Parameters
     ------------
     voxel : `trimesh.voxel.VoxelGrid`
@@ -288,21 +327,58 @@ def export_binvox(voxel, axis_order="xzy"):
     -----------
     result : bytes
       Representation according to binvox spec
+
+    Raises
+    -----------
+    ValueError
+      If the voxel transform has non-uniform pitch (anisotropic
+      voxels), rotation or shear, none of which binvox can express.
     """
-    translate = voxel.translation
-    scale = voxel.scale * (np.array(voxel.shape) - 1)
-    (neg_scale,) = np.where(scale < 0)
+    # the per-axis physical distance between neighboring cell centers
+    try:
+        pitch = np.abs(voxel.scale)
+    except RuntimeError as error:
+        # voxel.scale raises for rotation / shear, which binvox
+        # cannot represent either: surface an explicit binvox error
+        raise ValueError(
+            "binvox cannot represent a rotated or sheared voxel grid"
+        ) from error
+
+    # binvox has a single scalar scale, so the physical pitch must be
+    # identical along every axis -- a non-cubic *cell count* is fine as
+    # long as the cells themselves are cubes
+    if not util.allclose(pitch[0], pitch[1:], 1e-6 * pitch[0] + 1e-8):
+        raise ValueError(f"binvox requires uniform pitch, got {pitch!s}")
+    pitch = pitch[0]
+
+    shape = tuple(int(s) for s in voxel.shape)
+    if any(s < 2 for s in shape):
+        raise ValueError(
+            f"binvox grids need >= 2 cells per axis; got shape {shape!s}"
+        )
+
+    # reference the single scale against the axis with the most cells;
+    # for cubic grids this equals the historical `pitch * (n - 1)`
+    scale = pitch * (max(shape) - 1)
+
+    # binvox only stores positive scales, so negative per-axis scales are
+    # encoded by flipping the grid along those axes. The translation is
+    # shifted so the occupied cells keep their exact world positions:
+    # flipping index i -> n_i - 1 - i requires
+    # t'_i = t_i - pitch * (n_i - 1) on flipped axes.
+    signed_scale = voxel.scale
+    neg_scale, = np.where(signed_scale < 0)
     encoding = voxel.encoding.flip(neg_scale)
-    scale = np.abs(scale)
-    if not util.allclose(scale[0], scale[1:], 1e-6 * scale[0] + 1e-8):
-        raise ValueError("Can only export binvox with uniform scale")
-    scale = scale[0]
+    translate = np.array(voxel.translation, dtype=np.float64, copy=True)
+    for axis in neg_scale:
+        translate[axis] -= pitch * (shape[axis] - 1)
+
     if axis_order == "xzy":
         encoding = encoding.transpose((0, 2, 1))
     elif axis_order != "xyz":
         raise ValueError('Invalid axis_order: must be one of ("xyz", "xzy")')
     rle_data = encoding.flat.run_length_data(dtype=np.uint8)
-    return binvox_bytes(rle_data, shape=voxel.shape, translate=translate, scale=scale)
+    return binvox_bytes(rle_data, shape=shape, translate=translate, scale=scale)
 
 
 class Binvoxer:
