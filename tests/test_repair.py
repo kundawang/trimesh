@@ -294,6 +294,117 @@ def test_fix_normals_mixed_multibox():
     assert all(g.np.isclose(s.volume, 1.0) for s in split)
 
 
+def test_nested_shell_normals():
+    """
+    A reversed closed shell nested inside an outer shell is a
+    cavity: its normals must point inward rather than being flipped
+    outward. Nesting depth alternates the signed volume of every
+    nested shell (cavity, island inside a cavity, ...).
+    """
+    from trimesh.creation import box
+
+    def outward_winding(shell):
+        # a winding-derived (not cached normal) check: an interior
+        # point has to lie behind every outward-wound face
+        point = g.trimesh.repair._shell_interior_point(shell)
+        centers = shell.triangles.mean(axis=1)
+        dots = g.np.einsum(
+            "ij,ij->i", shell.triangles_cross, point - centers
+        )
+        return bool((dots < 0).all())
+
+    # outer box side 2 (volume 8) with a reversed inner box
+    # side 1 (cavity volume 1): solid volume is 8 - 1 = 7
+    outer = box(extents=(2, 2, 2))
+    cavity = box(extents=(1, 1, 1)).invert()
+    mesh = outer + cavity
+    assert g.np.isclose(mesh.volume, 7.0)
+
+    # process(validate=True) used to flip the cavity outward and
+    # turn the solid into a 8 + 1 = 9 multi-body volume
+    mesh.process(validate=True)
+    assert g.np.isclose(mesh.volume, 7.0), mesh.volume
+
+    shells = mesh.split(only_watertight=False)
+    assert len(shells) == 2
+    shells.sort(key=lambda s: -abs(s.volume))
+    outer_shell, cavity_shell = shells
+
+    # outer shell keeps outward normals and positive volume
+    assert g.np.isclose(outer_shell.volume, 8.0)
+    assert outward_winding(outer_shell)
+    # cavity shell keeps inward normals and negative signed volume
+    assert g.np.isclose(cavity_shell.volume, -1.0)
+    assert not outward_winding(cavity_shell)
+
+    # add an innermost island (side 0.5, volume 0.125) to check the
+    # alternating parity across three nesting levels
+    island = box(extents=(0.5, 0.5, 0.5))
+    three = box(extents=(2, 2, 2))
+    three += box(extents=(1, 1, 1)).invert()
+    three += island
+    assert g.np.isclose(three.volume, 8.0 - 1.0 + 0.125)
+    three.process(validate=True)
+    assert g.np.isclose(three.volume, 8.0 - 1.0 + 0.125), three.volume
+
+    shells = three.split(only_watertight=False)
+    shells.sort(key=lambda s: -abs(s.volume))
+    # positive, negative, positive signed volumes by nesting depth
+    assert g.np.allclose(
+        [s.volume for s in shells], [8.0, -1.0, 0.125]
+    )
+    assert [outward_winding(s) for s in shells] == [True, False, True]
+
+    # every shell handed in reversed must still come out correctly
+    wrong = box(extents=(2, 2, 2)).invert()
+    wrong += box(extents=(1, 1, 1))
+    wrong += box(extents=(0.5, 0.5, 0.5)).invert()
+    wrong.process(validate=True)
+    shells = wrong.split(only_watertight=False)
+    shells.sort(key=lambda s: -abs(s.volume))
+    assert g.np.allclose(
+        [s.volume for s in shells], [8.0, -1.0, 0.125]
+    )
+    assert [outward_winding(s) for s in shells] == [True, False, True]
+
+
+def test_nested_shell_normals_untouched_ambiguous():
+    """
+    Open shells and intersecting shells cannot have their nesting
+    established, so fix_normals must leave their winding alone and
+    report the situation rather than guessing.
+    """
+    from trimesh.creation import box
+
+    # an open (non-watertight) shell next to a valid nested pair
+    fragment = box(extents=(0.5, 0.5, 0.5)).apply_translation([4, 0, 0])
+    fragment.faces = fragment.faces[:-1]
+    assert not fragment.is_watertight
+    before_cross = fragment.triangles_cross.copy()
+
+    mesh = box(extents=(2, 2, 2))
+    mesh += box(extents=(1, 1, 1)).invert()
+    mesh += fragment
+    mesh.fix_normals()
+
+    # the closed nested pair is still a solid of volume 7
+    tight = mesh.split(only_watertight=True, repair=False)
+    assert g.np.isclose(sum(s.volume for s in tight), 7.0)
+    # the open fragment's winding is untouched
+    after_cross = mesh.triangles_cross[-len(before_cross):]
+    assert g.np.allclose(after_cross, before_cross, atol=1e-8)
+
+    # two intersecting closed shells: neither contains the other so
+    # the orientation cannot be resolved and nothing gets flipped
+    intersecting = box(extents=(2, 2, 2)).apply_translation(
+        [-0.5, 0, 0]
+    ).invert()
+    intersecting += box(extents=(2, 2, 2)).apply_translation([0.5, 0, 0])
+    before_faces = intersecting.faces.copy()
+    intersecting.fix_normals()
+    assert g.np.array_equal(intersecting.faces, before_faces)
+
+
 if __name__ == "__main__":
     g.trimesh.util.attach_to_log()
     test_fill_holes()

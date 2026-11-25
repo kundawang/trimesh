@@ -7,7 +7,7 @@ Fill holes and fix winding and normals of meshes.
 
 import numpy as np
 
-from . import graph, triangles
+from . import bounds, graph, triangles
 from .constants import log
 from .geometry import faces_to_edges, triangulate_quads
 from .graph import connected_components
@@ -87,16 +87,74 @@ def fix_winding(mesh):
     log.debug("flipped %d/%d edges", flipped, len(mesh.faces) * 3)
 
 
+def _shell_interior_point(shell):
+    """
+    Find a point strictly inside a closed, winding-consistent
+    shell regardless of whether its faces are currently wound
+    inwards or outwards.
+
+    For a consistently wound closed surface one of the two
+    points offset from a face centroid along (and opposite to)
+    the face normal lies inside the shell, so both candidates
+    are tested against the shell itself.
+
+    Parameters
+    -------------
+    shell : trimesh.Trimesh
+      A watertight, winding-consistent single shell.
+
+    Returns
+    -------------
+    point : (3,) float or None
+      A point inside the shell, or `None` if none of the
+      candidate points could be confirmed to be inside.
+    """
+    # try the largest faces first as their offset distance is
+    # less likely to be numerically problematic
+    order = np.argsort(shell.area_faces)[::-1]
+    step = max(shell.scale, np.finfo(np.float64).eps) * 1e-3
+    for index in order:
+        centroid = shell.triangles[index].mean(axis=0)
+        normal = shell.face_normals[index]
+        candidates = np.vstack(
+            (centroid - normal * step, centroid + normal * step)
+        )
+        inside = shell.contains(candidates)
+        if inside.any():
+            return candidates[np.argmax(inside)]
+    return None
+
+
 def fix_inversion(mesh, multibody: bool = False):
     """
     Check to see if a mesh has normals pointing "out."
+
+    For a single watertight shell a negative signed volume means
+    the shell is inverted and every face is flipped.
+
+    For a mesh of multiple disconnected shells the shells may be
+    nested: a reversed inner shell is a cavity rather than an
+    inverted body. Each shell is oriented according to its nesting
+    depth instead of its raw signed volume:
+
+    * even depth (outer shells, standalone bodies): normals out,
+      signed volume positive
+    * odd depth (cavities, islands inside cavities, ...): normals
+      in, signed volume negative, alternating with every layer
+
+    Shells that are not watertight, or whose spatial relationship
+    is ambiguous (intersecting shells, or shells for which no
+    interior point can be established) are left untouched. Such
+    cases are reported through the logger rather than guessed at.
 
     Parameters
     -------------
     mesh : trimesh.Trimesh
       Mesh to fix in-place.
     multibody : bool
-      If True will try to fix normals on every body
+      If True orient every disconnected shell taking their
+      spatial nesting into account, otherwise only consider the
+      mesh as a single body.
     """
 
     # we are not considering multiple bodies so we only need to
@@ -108,7 +166,9 @@ def fix_inversion(mesh, multibody: bool = False):
         return
 
     # get groups of connected faces
-    groups = connected_components(mesh.face_adjacency)
+    groups = connected_components(
+        mesh.face_adjacency, nodes=np.arange(len(mesh.faces))
+    )
 
     # mask of faces to flip
     flip = np.zeros(len(mesh.faces), dtype=bool)
@@ -119,6 +179,8 @@ def fix_inversion(mesh, multibody: bool = False):
     # get the edges indexable as faces
     face_edges = mesh.edges.reshape((-1, 6))
 
+    # watertight shells as (face indices, submesh, signed volume)
+    shells = []
     # loop through indexes of `mesh.faces`
     for face_index in groups:
         # we need watertight bodies to do anything so immediately
@@ -126,20 +188,101 @@ def fix_inversion(mesh, multibody: bool = False):
         if len(face_index) < 4:
             continue
         # check the watertightness and winding of this group
-        is_tight, is_wound = graph.is_watertight(face_edges[face_index].reshape((-1, 2)))
+        is_tight, is_wound = graph.is_watertight(
+            face_edges[face_index].reshape((-1, 2))
+        )
 
-        # if we're not completely correct skip it as flipping faces will make it worse
+        # if we're not completely correct skip it as flipping
+        # faces will make it worse
         if not (is_tight and is_wound):
+            log.warning(
+                "skipping non-watertight shell with %d faces", len(face_index)
+            )
             continue
 
         # check the volume for just this body
         volume = triangles.mass_properties(
             tri[face_index], crosses=cross[face_index], skip_inertia=True
         ).volume
-        # if that volume is negative it is either
-        # inverted or just total garbage
-        if volume < 0.0:
-            flip[face_index] = True
+
+        shells.append([np.asanyarray(face_index), None, float(volume)])
+
+    if len(shells) <= 1:
+        # a single shell uses the plain signed-volume rule which
+        # preserves the historical single-body behavior
+        if len(shells) == 1 and shells[0][2] < 0.0:
+            flip[shells[0][0]] = True
+    else:
+        # build an independent submesh per shell so ray tests only
+        # intersect the geometry of that shell
+        for entry in shells:
+            entry[1] = mesh.submesh([entry[0]], repair=False, append=True)
+
+        # establish one known interior point per shell
+        interior = []
+        for entry in shells:
+            point = _shell_interior_point(entry[1])
+            if point is None:
+                log.warning("could not determine an interior point for a shell; leaving nested shells unmodified")
+                # bail out entirely rather than orienting on a guess
+                interior = None
+                break
+            interior.append(point)
+
+        if interior is not None:
+            # containment[i, j] is True when shell j contains the
+            # interior point of shell i, i.e. shell i is inside j
+            n = len(shells)
+            containment = np.eye(n, dtype=bool)
+            for i, point in enumerate(interior):
+                for j, entry in enumerate(shells):
+                    if i == j:
+                        continue
+                    # cheap axis-aligned bounding box rejection
+                    if not bounds.contains(
+                        entry[1].bounds, point.reshape((1, 3))
+                    )[0]:
+                        continue
+                    containment[i, j] = entry[1].contains(
+                        point.reshape((1, 3))
+                    )[0]
+
+            # every shell pair must form either a clean parent/child
+            # nesting (containment in exactly one direction) or be
+            # completely disjoint; anything else means the shells
+            # intersect and their nesting can't be established
+            ambiguous = False
+            for i in range(n):
+                if ambiguous:
+                    break
+                for j in range(i + 1, n):
+                    nested = containment[i, j] or containment[j, i]
+                    if nested:
+                        continue
+                    # neither shell contains the other: only valid
+                    # if their axis aligned bounding boxes are disjoint
+                    overlap_aabb = bounds.contains(
+                        shells[i][1].bounds, interior[j].reshape((1, 3))
+                    )[0] or bounds.contains(
+                        shells[j][1].bounds, interior[i].reshape((1, 3))
+                    )[0]
+                    if overlap_aabb:
+                        ambiguous = True
+                        break
+
+            if ambiguous:
+                log.warning("intersecting or ambiguously nested shells detected; leaving shell orientations unmodified")
+            else:
+                # nesting depth: number of shells strictly containing
+                # this one (the diagonal entry is excluded)
+                for i, entry in enumerate(shells):
+                    depth = int(containment[i].sum()) - 1
+                    # even depth shells point out (positive volume),
+                    # odd depth shells point in (negative volume)
+                    want_positive = depth % 2 == 0
+                    is_positive = entry[2] > 0.0
+                    if want_positive != is_positive:
+                        flip[entry[0]] = True
 
     # one or more faces needs flipping
     if flip.any():
