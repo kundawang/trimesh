@@ -56,6 +56,51 @@ def validate_glb(data, name=None):
 load_kwargs = g.trimesh.exchange.load._load_kwargs
 
 
+def _parse_glb(data):
+    """
+    Independently parse a GLB export into its JSON header
+    and binary chunk without using trimesh loaders.
+    """
+    magic, _version, length = g.np.frombuffer(data[:12], dtype="<u4")
+    assert magic == 0x46546C67  # "glTF"
+    header, blob = None, b""
+    offset = 12
+    while offset < length:
+        chunk_length, chunk_type = g.np.frombuffer(
+            data[offset : offset + 8], dtype="<u4"
+        )
+        chunk = data[offset + 8 : offset + 8 + chunk_length]
+        if chunk_type == 0x4E4F534A:  # "JSON"
+            header = g.json.loads(chunk.decode("utf-8"))
+        elif chunk_type == 0x004E4942:  # "BIN"
+            blob = chunk
+        offset += 8 + chunk_length
+    assert header is not None
+    return header, blob
+
+
+def _read_accessor(header, blob, index):
+    """
+    Independently read an accessor's data from a GLB binary chunk.
+    """
+    acc = header["accessors"][index]
+    view = header["bufferViews"][acc["bufferView"]]
+    start = view.get("byteOffset", 0) + acc.get("byteOffset", 0)
+    n_comp = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4}[acc["type"]]
+    dtype = {
+        5120: "<i1",
+        5121: "<u1",
+        5122: "<i2",
+        5123: "<u2",
+        5125: "<u4",
+        5126: "<f4",
+    }[acc["componentType"]]
+    count = acc["count"]
+    return g.np.frombuffer(blob, dtype=dtype, count=count * n_comp, offset=start).reshape(
+        count, n_comp
+    )
+
+
 def world_root_tree():
     # minimal single-file glTF whose ROOT node is named "world"
     # and carries a transform — the shape external tools produce
@@ -227,6 +272,100 @@ class GLTFTest(g.unittest.TestCase):
         assert rs.geometry["TestBlendMesh"].visual.material.alphaMode == "BLEND"
         # defaults OPAQUE
         assert rs.geometry["TestOpaqueMesh"].visual.material.alphaMode is None
+
+    def test_face_color_alpha_export(self):
+        # a ColorVisuals with non-opaque alpha should export a GLB
+        # containing both COLOR_0 and a material with alphaMode BLEND
+        # so viewers actually render the transparency
+        box = g.trimesh.creation.box()
+        box.visual.face_colors = [255, 0, 0, 100]
+
+        export = box.export(file_type="glb")
+        validate_glb(export, "transparent_box")
+        header, blob = _parse_glb(export)
+
+        # exactly one material should have been generated
+        assert len(header["materials"]) == 1
+        material = header["materials"][0]
+        # transparency requires BLEND or viewers render it opaque
+        assert material["alphaMode"] == "BLEND"
+        # white base color so the COLOR_0 values are preserved
+        assert g.np.allclose(
+            material["pbrMetallicRoughness"]["baseColorFactor"], [1, 1, 1, 1]
+        )
+
+        prim = header["meshes"][0]["primitives"][0]
+        assert prim["material"] == 0
+        assert "COLOR_0" in prim["attributes"]
+
+        # check the COLOR_0 accessor layout independently
+        acc = header["accessors"][prim["attributes"]["COLOR_0"]]
+        assert acc["componentType"] == 5121  # unsigned byte
+        assert acc["normalized"] is True
+        assert acc["type"] == "VEC4"
+        colors = _read_accessor(header, blob, prim["attributes"]["COLOR_0"])
+        assert colors.shape == (len(box.vertices), 4)
+        # every vertex color should be the transparent red
+        assert (colors == [255, 0, 0, 100]).all()
+
+        # roundtrip: colors and transparency should survive
+        reloaded = g.trimesh.load(
+            g.trimesh.util.wrap_as_stream(export), file_type="glb", process=False
+        )
+        mesh = next(iter(reloaded.geometry.values()))
+        assert mesh.visual.material.alphaMode == "BLEND"
+        colors = mesh.visual.vertex_attributes["color"]
+        assert (colors == [255, 0, 0, 100]).all()
+
+    def test_face_color_opaque_export(self):
+        # fully opaque face colors should keep the previous export
+        # semantics: COLOR_0 is written but no material is appended
+        box = g.trimesh.creation.box()
+        box.visual.face_colors = [0, 255, 0, 255]
+
+        export = box.export(file_type="glb")
+        validate_glb(export, "opaque_box")
+        header, blob = _parse_glb(export)
+
+        prim = header["meshes"][0]["primitives"][0]
+        # colors should be exported
+        assert "COLOR_0" in prim["attributes"]
+        # but no material should be referenced or defined
+        assert "material" not in prim
+        assert len(header.get("materials", [])) == 0
+
+        colors = _read_accessor(header, blob, prim["attributes"]["COLOR_0"])
+        assert (colors == [0, 255, 0, 255]).all()
+
+        # roundtrip should come back as colors with no material
+        reloaded = g.trimesh.load(
+            g.trimesh.util.wrap_as_stream(export), file_type="glb", process=False
+        )
+        mesh = next(iter(reloaded.geometry.values()))
+        assert not hasattr(mesh.visual, "material")
+        assert (mesh.visual.face_colors == [0, 255, 0, 255]).all()
+
+    def test_face_color_mixed_alpha_export(self):
+        # a mesh where only some faces are transparent should still
+        # export alphaMode BLEND rather than dropping all transparency
+        box = g.trimesh.creation.box()
+        colors = g.np.tile([255, 0, 0, 255], (len(box.faces), 1)).astype(g.np.uint8)
+        colors[: len(box.faces) // 2] = [0, 0, 255, 100]
+        box.visual.face_colors = colors
+
+        export = box.export(file_type="glb")
+        validate_glb(export, "mixed_box")
+        header, blob = _parse_glb(export)
+
+        # any non-255 alpha means the primitive must be BLEND
+        assert len(header["materials"]) == 1
+        assert header["materials"][0]["alphaMode"] == "BLEND"
+
+        prim = header["meshes"][0]["primitives"][0]
+        colors_back = _read_accessor(header, blob, prim["attributes"]["COLOR_0"])
+        # both the opaque and transparent face colors should be preserved
+        assert (colors_back == [255, 0, 0, 255]).all(axis=1).any()
+        assert (colors_back == [0, 0, 255, 100]).all(axis=1).any()
 
     def test_units(self):
         # Trimesh will store units as a GLTF extra if they

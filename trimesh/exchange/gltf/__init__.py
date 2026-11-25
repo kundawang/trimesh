@@ -934,6 +934,32 @@ def _append_mesh(
             mat_hashes=mat_hashes,
             extension_webp=extension_webp,
         )
+    elif (
+        vertex_colors is not None
+        and len(vertex_colors) == len(mesh.vertices)
+        and vertex_colors.shape[-1] == 4
+        and (vertex_colors[:, 3] < 255).any()
+    ):
+        # a `ColorVisuals` with any non-opaque alpha: glTF viewers
+        # ignore the alpha of `COLOR_0` unless the primitive references
+        # a material with `alphaMode: BLEND` so append a simple white
+        # PBR material which preserves the per-face/per-vertex colors
+        current_material = _append_material(
+            mat=visual.material.PBRMaterial(
+                baseColorFactor=[1.0, 1.0, 1.0, 1.0],
+                metallicFactor=0.0,
+                roughnessFactor=1.0,
+                alphaMode="BLEND",
+            ),
+            tree=tree,
+            buffer_items=buffer_items,
+            mat_hashes=mat_hashes,
+            extension_webp=extension_webp,
+        )
+    else:
+        current_material = None
+
+    if current_material is not None:
 
         # if mesh has UV coordinates defined export them
         has_uv = (
