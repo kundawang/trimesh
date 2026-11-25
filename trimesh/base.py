@@ -3041,6 +3041,37 @@ class Trimesh(Geometry3D):
         """
         return export_mesh(mesh=self, file_obj=file_obj, file_type=file_type, **kwargs)
 
+    def export_preflight(self, file_type: str | None = None, **kwargs):
+        """
+        Report which UV/color attributes an export of this mesh can preserve.
+
+        Parameters
+        ----------
+        file_type : str or None
+          Target format (eg: 'stl', 'ply', 'obj'). If None and a file
+          name is passed via ``file_obj`` the extension is used.
+
+        Returns
+        ----------
+        report : trimesh.exchange.preflight.ExportReport
+          Structured support report.
+        """
+        from .exchange.preflight import check_export
+
+        return check_export(mesh=self, file_type=file_type, **kwargs)
+
+    def check_export(self, file_type: str | None = None, **kwargs):
+        """Alias for :meth:`export_preflight`."""
+        from .exchange.preflight import check_export
+
+        return check_export(mesh=self, file_type=file_type, **kwargs)
+
+    def export_check(self, file_type: str | None = None, **kwargs):
+        """Alias for :meth:`export_preflight`."""
+        from .exchange.preflight import check_export
+
+        return check_export(mesh=self, file_type=file_type, **kwargs)
+
     def to_dict(self) -> dict[str, str | list[list[float]] | list[list[int]]]:
         """
         Return a dictionary representation of the current mesh

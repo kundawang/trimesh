@@ -12,3 +12,19 @@ of the various loaders:
 mesh = trimesh.load(file_name)
 ```
 """
+
+from .preflight import (
+    ExportPreflightError,
+    ExportReport,
+    ExportStatus,
+    check_export,
+    export_preflight,
+)
+
+__all__ = [
+    "ExportPreflightError",
+    "ExportReport",
+    "ExportStatus",
+    "check_export",
+    "export_preflight",
+]

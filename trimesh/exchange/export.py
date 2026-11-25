@@ -10,13 +10,67 @@ from .gltf import export_glb, export_gltf
 from .obj import export_obj
 from .off import _off_exporters
 from .ply import _ply_exporters
+from .preflight import ExportPreflightError, check_export
 from .stl import export_stl, export_stl_ascii
 from .threemf import _3mf_exporters
 from .urdf import export_urdf  # NOQA
 from .xyz import _xyz_exporters
 
+# additional public preflight names reachable from this historical module
+_PREFLIGHT_REEXPORT = {
+    "SUPPORTED",
+    "FORMAT_UNSUPPORTED",
+    "EXPORTER_UNSUPPORTED",
+    "NOT_PRESENT",
+    "UNKNOWN",
+    "ExportStatus",
+    "SupportStatus",
+    "PreflightStatus",
+    "ExportSupport",
+    "AttributeSupport",
+    "ExportReport",
+    "StrictExportError",
+    "ExportLossError",
+    "UnsupportedExportError",
+    "ExportCompatibilityError",
+    "PreflightError",
+    "ExportValidationError",
+    "ExportCheckError",
+    "UnsupportedAttributeError",
+    "export_preflight",
+    "preflight_export",
+    "export_precheck",
+    "check_export_support",
+    "export_report",
+    "get_export_report",
+    "get_export_support",
+    "export_support",
+    "support_report",
+    "validate_export",
+}
 
-def export_mesh(mesh, file_obj, file_type=None, resolver=None, **kwargs):
+
+def __getattr__(name):
+    # PEP 562: lazily resolve `from trimesh.exchange.export import <alias>`
+    # for the rest of the preflight API without eager re-export noise.
+    if name in _PREFLIGHT_REEXPORT:
+        from . import preflight
+
+        return getattr(preflight, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def export_mesh(
+    mesh,
+    file_obj=None,
+    file_type=None,
+    resolver=None,
+    strict: bool = False,
+    required_attributes=None,
+    attributes=None,
+    required=None,
+    **kwargs,
+):
     """
     Export a Trimesh object to a file- like object, or to a filename
 
@@ -28,6 +82,16 @@ def export_mesh(mesh, file_obj, file_type=None, resolver=None, **kwargs):
       Represents file type (eg: 'stl')
     resolver : None or trimesh.resolvers.Resolver
       Resolver to write referenced assets to
+    strict : bool
+      If True, run an export preflight and raise
+      :class:`~trimesh.exchange.preflight.ExportPreflightError` before
+      opening/writing the file when attributes present on the mesh
+      (or named in ``required_attributes``) cannot be preserved.
+      Default False preserves the existing export behavior and bytes.
+    required_attributes : list of str or None
+      Attributes that must be preserved in strict mode, for example
+      ``["uv", "vertex_colors"]``. If None, every visual attribute
+      actually present on the mesh is checked.
 
     Returns
     ----------
@@ -42,6 +106,23 @@ def export_mesh(mesh, file_obj, file_type=None, resolver=None, **kwargs):
     if util.is_pathlib(file_obj):
         # handle `pathlib` objects by converting to string
         file_obj = str(file_obj.absolute())
+
+    # opt-in preflight: run before any file is opened or written so a
+    # rejected export doesn't leave a partially written output behind
+    if strict:
+        if required_attributes is None:
+            required_attributes = attributes if attributes is not None else required
+        preflight_type = file_type
+        if preflight_type is None and isinstance(file_obj, str):
+            preflight_type = str(file_obj).split(".")[-1]
+        report = check_export(
+            mesh,
+            file_type=preflight_type,
+            required_attributes=required_attributes,
+            **kwargs,
+        )
+        if not report.compatible:
+            raise ExportPreflightError(report=report)
 
     if isinstance(file_obj, str):
         if file_type is None:
@@ -221,7 +302,7 @@ def scene_to_dict(scene, use_base64=False, include_metadata=True):
     return export
 
 
-def export_scene(scene, file_obj, file_type=None, resolver=None, **kwargs):
+def export_scene(scene, file_obj=None, file_type=None, resolver=None, **kwargs):
     """
     Export a snapshot of the current scene.
 
@@ -238,6 +319,10 @@ def export_scene(scene, file_obj, file_type=None, resolver=None, **kwargs):
     export : bytes
       Only returned if file_obj is None
     """
+    # strict/required_attributes are preflight controls, not exporter kwargs
+    strict = kwargs.pop("strict", False)
+    required_attributes = kwargs.pop("required_attributes", None)
+
     if len(scene.geometry) == 0:
         raise ValueError("Can't export empty scenes!")
 
@@ -254,6 +339,15 @@ def export_scene(scene, file_obj, file_type=None, resolver=None, **kwargs):
 
     # always remove whitespace and leading characters
     file_type = file_type.strip().lower().lstrip(".")
+
+    if strict:
+        report = check_export(
+            scene,
+            file_type=file_type,
+            required_attributes=required_attributes,
+        )
+        if not report.compatible:
+            raise ExportPreflightError(report=report)
 
     # now handle our different scene export types
     if file_type == "gltf":

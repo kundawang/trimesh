@@ -57,6 +57,15 @@ from .exchange.load import (
     load_scene,
 )
 
+# opt-in export preflight diagnostics
+from .exchange.preflight import (
+    ExportPreflightError,
+    ExportReport,
+    ExportStatus,
+    check_export,
+    export_preflight,
+)
+
 # geometry objects
 from .parent import Geometry
 from .points import PointCloud
@@ -83,6 +92,9 @@ except BaseException as E:
 
 
 __all__ = [
+    "ExportPreflightError",
+    "ExportReport",
+    "ExportStatus",
     "Geometry",
     "PointCloud",
     "Scene",
@@ -92,6 +104,7 @@ __all__ = [
     "boolean",
     "bounds",
     "caching",
+    "check_export",
     "collision",
     "comparison",
     "convex",
@@ -99,6 +112,7 @@ __all__ = [
     "curvature",
     "decomposition",
     "exceptions",
+    "export_preflight",
     "geometry",
     "graph",
     "grouping",
