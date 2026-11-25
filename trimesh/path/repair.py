@@ -12,6 +12,33 @@ from .. import util
 from . import segments
 
 
+def merge_close_vertices(path, radius=None, distance=None):
+    """
+    Merge nearby topological endpoints of a `Path2D` by actual
+    Euclidean distance. Operations are done in-place.
+
+    Unlike decimal-place vertex merging this only considers degree-one
+    endpoints and will not join independent connected components or
+    collapse an existing short edge.
+
+    Parameters
+    ------------
+    path : trimesh.path.Path2D
+      Path whose endpoints will be merged.
+    radius : None or float
+      Maximum endpoint distance that may be merged.
+    distance : None or float
+      Alias for `radius`.
+
+    Returns
+    ------------
+    path : trimesh.path.Path2D
+      The same path object, modified in-place.
+    """
+    path.merge_vertices(radius=radius, distance=distance)
+    return path
+
+
 def fill_gaps(path, distance=0.025):
     """
     Find vertices without degree 2 and try to connect to

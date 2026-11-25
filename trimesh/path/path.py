@@ -544,22 +544,107 @@ class Path(parent.Geometry):
 
         return matrix
 
-    def merge_vertices(self, digits=None):
+    def merge_vertices(self, digits=None, radius=None, distance=None, **kwargs):
         """
         Merges vertices which are identical and replace references
         by altering `self.entities` and `self.vertices`
 
+        When `radius` is provided this switches to a distance based
+        merge that only considers topological endpoints (vertices of
+        degree one). Two endpoints are merged only when they are part
+        of the same connected component and are not already joined by
+        a segment, which closes open contours without joining
+        independent paths or collapsing short edges.
+
         Parameters
         --------------
         digits : None, or int
-          How many digits to consider when merging vertices
+          How many digits to consider when merging vertices. This is
+          the original rounding based behavior and is used whenever
+          `radius` is None.
+        radius : None, or float
+          If provided, merge allowed endpoint pairs whose actual
+          Euclidean distance is at most `radius`. Must be a finite
+          non-negative number. `0.0` only merges coincident endpoints.
+        distance : None, or float
+          Alias for `radius`, used if `radius` is not provided.
         """
+        # accept a few descriptive alternative names for the radius
+        if radius is None and distance is None:
+            for alias in ("tolerance", "tol", "max_distance", "merge_radius"):
+                if alias in kwargs:
+                    radius = kwargs.pop(alias)
+                    break
+        # preserve the normal unexpected-keyword TypeError contract
+        if kwargs:
+            unexpected = next(iter(kwargs))
+            raise TypeError(
+                f"merge_vertices() got an unexpected keyword argument {unexpected!r}"
+            )
+
         if len(self.vertices) == 0:
             return
+
+        # `distance` is accepted as a synonym for `radius`
+        if radius is None and distance is not None:
+            radius = distance
+
+        if radius is not None:
+            merged = self._endpoint_merge_inverse(radius)
+            if merged is None:
+                # nothing topologically allowed to merge: leave the
+                # vertices, entities and indexes exactly as they were
+                return
+            unique, inverse = merged
+            self._apply_vertex_merge(unique, inverse)
+            self._cache.clear()
+            return
+
         if digits is None:
             digits = util.decimal_to_digits(tol.merge * self.scale, min_digits=1)
 
         unique, inverse = grouping.unique_rows(self.vertices, digits=digits)
+        self._apply_vertex_merge(unique, inverse)
+
+    def merge_close_vertices(self, radius=None, distance=None):
+        """
+        Merge topologically allowed endpoints separated by at most
+        `radius` by actual Euclidean distance.
+
+        This is a convenience wrapper around
+        `merge_vertices(radius=...)`.
+
+        Parameters
+        --------------
+        radius : float
+          Maximum distance between two endpoints that may be merged.
+        distance : None, or float
+          Alias for `radius`.
+        """
+        self.merge_vertices(radius=radius, distance=distance)
+
+    # descriptive aliases for the distance based endpoint merge
+    merge_nearby_vertices = merge_close_vertices
+    merge_nearby_endpoints = merge_close_vertices
+    merge_close_endpoints = merge_close_vertices
+    merge_endpoints = merge_close_vertices
+
+    def _apply_vertex_merge(self, unique, inverse):
+        """
+        Compact vertices to `unique` representatives and remap every
+        entity's vertex references through `inverse`, dropping runs of
+        duplicate references and degenerate entities.
+
+        Parameters
+        --------------
+        unique : (m,) int
+          Original vertex indices retained as representatives.
+        inverse : (len(self.vertices),) int
+          New vertex index for every original vertex.
+        """
+        unique = np.asarray(unique)
+        inverse = np.asarray(inverse)
+
         self.vertices = self.vertices[unique]
         self.vertex_attributes = {
             key: np.array(value)[unique] for key, value in self.vertex_attributes.items()
@@ -595,6 +680,133 @@ class Path(parent.Geometry):
 
         # remove degenerate entities
         self.entities = self.entities[entities_ok]
+
+    def _endpoint_merge_inverse(self, radius):
+        """
+        Compute a stable representative/inverse mapping for merging
+        nearby topological endpoints.
+
+        Only degree-one vertices are considered and a pair is merged
+        only when both endpoints:
+          * are at most `radius` apart,
+          * belong to the same connected component (so independent
+            contours are never joined), and
+          * are not already connected by a graph edge (so an existing
+            short edge is never collapsed to zero length).
+
+        The lowest original index in every merged group is used as the
+        stable representative.
+
+        Parameters
+        --------------
+        radius : float
+          Non-negative finite maximum endpoint distance.
+
+        Returns
+        --------------
+        merged : None or (unique, inverse)
+          Returns None when no merge is allowed, otherwise the
+          retained representative indices and the remap array.
+        """
+        # validate the radius deterministically: every invalid value
+        # raises the same ValueError rather than producing undefined
+        # KDTree or comparison behavior
+        try:
+            radius = float(radius)
+        except (TypeError, ValueError) as E:
+            raise ValueError(
+                f"radius must be a finite non-negative number, got {radius!r}"
+            ) from E
+        if not np.isfinite(radius) or radius < 0.0:
+            raise ValueError(
+                f"radius must be a finite non-negative number, got {radius!r}"
+            )
+
+        count = len(self.vertices)
+
+        # topology of the open entities; closed entities have no ends
+        graph, _closed = traversal.vertex_graph(self.entities)
+        degree = dict(graph.degree())
+
+        # only topological endpoints (degree one) are eligible
+        endpoints = np.array(
+            sorted(int(v) for v, d in degree.items() if d == 1), dtype=np.int64
+        )
+        if endpoints.size < 2:
+            return None
+
+        # label the connected component of every referenced vertex
+        component = np.full(count, -1, dtype=np.int64)
+        for label, nodes in enumerate(nx.connected_components(graph)):
+            component[
+                np.fromiter((int(v) for v in nodes), dtype=np.int64, count=len(nodes))
+            ] = label
+
+        # find endpoint pairs inside the radius using actual distance
+        coordinates = np.asarray(self.vertices, dtype=np.float64)
+        tree = cKDTree(coordinates[endpoints])
+        pairs = tree.query_pairs(r=radius, output_type="ndarray")
+        pairs = np.asarray(pairs, dtype=np.int64).reshape((-1, 2))
+        if pairs.size == 0:
+            return None
+
+        # query_pairs indexes into the endpoint subset, map to vertices
+        left = endpoints[pairs[:, 0]]
+        right = endpoints[pairs[:, 1]]
+        low = np.minimum(left, right)
+        high = np.maximum(left, right)
+
+        # never merge endpoints across independent components
+        same_component = component[low] == component[high]
+
+        # never merge endpoints already joined by a segment, which
+        # would compress that (possibly short) edge to zero length
+        edges = {tuple(sorted((int(a), int(b)))) for a, b in graph.edges}
+        not_adjacent = np.fromiter(
+            ((int(a), int(b)) not in edges for a, b in zip(low, high)),
+            dtype=bool,
+            count=len(low),
+        )
+
+        allowed = np.flatnonzero(same_component & not_adjacent)
+        if allowed.size == 0:
+            return None
+
+        # union allowed pairs into transitive groups, keeping the
+        # smallest original index as the root representative
+        parent = np.arange(count, dtype=np.int64)
+
+        def find(index):
+            while parent[index] != index:
+                parent[index] = parent[parent[index]]
+                index = parent[index]
+            return index
+
+        order = np.lexsort((high[allowed], low[allowed]))
+        for k in order:
+            a = int(low[allowed[k]])
+            b = int(high[allowed[k]])
+            ra = find(a)
+            rb = find(b)
+            if ra == rb:
+                continue
+            if ra < rb:
+                parent[rb] = ra
+            else:
+                parent[ra] = rb
+
+        # only endpoints can have been unioned, every other vertex is
+        # its own root, so resolve roots over endpoints only
+        roots = np.arange(count, dtype=np.int64)
+        for endpoint in endpoints:
+            roots[int(endpoint)] = find(int(endpoint))
+        unique = np.unique(roots)
+        inverse = np.searchsorted(unique, roots).astype(np.int64)
+
+        if len(unique) == count:
+            return None
+
+        return unique, inverse
 
     def replace_vertex_references(self, mask):
         """
