@@ -1836,7 +1836,31 @@ def _read_buffers(
                 face_materials = []
                 for i, p in enumerate(current):
                     face_materials += [i] * len(p["faces"])
+
+                # UV coordinates are per-vertex, so concatenate them in
+                # the same order `append_faces` stacked the vertices: UV
+                # row `i` then corresponds to merged vertex `i`. A
+                # primitive without TEXCOORD_0 contributes zero UVs to
+                # keep the arrays aligned; only when every primitive is
+                # missing UVs is the merged UV left as `None`.
+                uv = None
+                uv_blocks = [p["visual"].uv for p in current]
+                if any(block is not None for block in uv_blocks):
+                    uv = np.zeros((len(v), 2), dtype=np.float64)
+                    vertex_offset = 0
+                    for p, block in zip(current, uv_blocks):
+                        count = len(p["vertices"])
+                        if block is not None:
+                            block = np.asarray(block)
+                            if block.shape[0] != count:
+                                # a corrupt/non-conformant accessor must
+                                # not silently misalign UVs with vertices
+                                raise ValueError("UV count does not match vertices")
+                            uv[vertex_offset : vertex_offset + count] = block[:, :2]
+                        vertex_offset += count
+
                 merged["visual"] = visual.texture.TextureVisuals(
+                    uv=uv,
                     material=visual.material.MultiMaterial(materials=materials),
                     face_materials=face_materials,
                 )
