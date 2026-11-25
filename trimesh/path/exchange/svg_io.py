@@ -670,7 +670,16 @@ def _format_attrib(attrib):
     attrib : dict
       Bag of keys and values.
     """
-    bag = {k: _encode(v) for k, v in attrib.items()}
+    bag = {}
+    for k, v in attrib.items():
+        try:
+            bag[k] = _encode(v)
+        except BaseException:
+            # metadata values that cannot be packed into an XML
+            # attribute (for example per-segment face index arrays)
+            # are omitted rather than failing the whole export
+            log.debug("failed to encode entity metadata %s", k, exc_info=True)
+            bag[k] = None
     return "\n".join(
         f'{_ns_name}:{k}="{v}"'
         for k, v in bag.items()

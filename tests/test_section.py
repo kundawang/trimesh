@@ -608,6 +608,184 @@ def test_slice_cap_topology_controls(engine):
     assert len(removed.faces) == 0
 
 
+def _independent_triangle_segment(triangle, origin, normal, eps=1e-9):
+    """
+    Independent plane/triangle intersection used to cross-check the
+    face source mapping without calling `mesh_plane`.
+    """
+    normal = g.np.asarray(normal, dtype=float)
+    normal /= g.np.linalg.norm(normal)
+    dots = (g.np.asarray(triangle, dtype=float) - origin) @ normal
+    if dots.max() < -eps or dots.min() > eps:
+        return None
+
+    points = [triangle[i].astype(float) for i in range(3) if abs(dots[i]) <= eps]
+    for i in range(3):
+        for j in range(i + 1, 3):
+            if dots[i] * dots[j] < 0.0:
+                t = dots[i] / (dots[i] - dots[j])
+                points.append(triangle[i] + t * (triangle[j] - triangle[i]))
+
+    unique = []
+    for p in points:
+        if not any(g.np.linalg.norm(p - q) < 1e-8 for q in unique):
+            unique.append(p)
+    if len(unique) < 2:
+        return None
+    # the intersection of a convex triangle with a plane is a segment
+    return g.np.array(
+        max(
+            ((a, b) for a in unique for b in unique if a is not b),
+            key=lambda pair: g.np.linalg.norm(pair[0] - pair[1]),
+        )
+    )
+
+
+def _same_segment(a, b, atol=1e-6):
+    return (
+        g.np.allclose(a[0], b[0], atol=atol) and g.np.allclose(a[1], b[1], atol=atol)
+    ) or (g.np.allclose(a[0], b[1], atol=atol) and g.np.allclose(a[1], b[0], atol=atol))
+
+
+def test_section_contour_face_source():
+    """
+    Two disconnected boxes three units apart section into two closed
+    contours; each contour's face source must stay on its own box and
+    agree with an independent triangle-plane intersection.
+    """
+    box_a = g.trimesh.creation.box()
+    box_b = g.trimesh.creation.box()
+    box_b.apply_translation([3.0, 0.0, 0.0])
+    mesh = g.trimesh.util.concatenate([box_a, box_b])
+    split = len(box_a.faces)
+
+    origin = [0.0, 0.0, 0.0]
+    normal = [0.0, 0.0, 1.0]
+
+    # default return type and geometry are unchanged
+    section = mesh.section(plane_origin=origin, plane_normal=normal)
+    assert isinstance(section, g.trimesh.path.Path3D)
+    assert section is not None
+    closed = [e for e in section.entities if e.closed]
+    assert len(closed) == 2
+
+    by_entity = section.metadata["face_index_by_entity"]
+    assert len(by_entity) == len(section.entities) == 2
+
+    groups = [set(g.np.asarray(f).tolist()) for f in by_entity]
+    # the two contours must not share any source face
+    assert groups[0].isdisjoint(groups[1])
+    # every contour references only the faces of one of the boxes
+    owned = []
+    for group in groups:
+        if group and all(i < split for i in group):
+            owned.append("a")
+        elif group and all(i >= split for i in group):
+            owned.append("b")
+        else:  # pragma: no cover - should never happen
+            raise AssertionError(f"contour mixes boxes: {sorted(group)}")
+    assert sorted(owned) == ["a", "b"]
+
+    # grouped mapping covers exactly the flat per-segment face index
+    flat = g.np.asarray(section.metadata["face_index"])
+    assert isinstance(flat, g.np.ndarray)
+    assert set(g.np.concatenate(by_entity).tolist()) == set(flat.tolist())
+
+    # every assembled segment carries an aligned source face index
+    for entity, faces in zip(section.entities, by_entity):
+        segment_faces = g.np.asarray(entity.metadata["face_index"])
+        assert len(segment_faces) == len(entity.points) - 1
+        assert set(g.np.unique(segment_faces).tolist()) == set(faces.tolist())
+
+    # independent triangle intersection cross-checks the source and
+    # confirms each mapped face segment lies on the assigned contour
+    for entity, face_ids in zip(section.entities, by_entity):
+        idx = g.np.asarray(entity.points)
+        contour_segments = g.np.stack(
+            [section.vertices[idx[:-1]], section.vertices[idx[1:]]], axis=1
+        )
+        independent = {}
+        for face_id in g.np.asarray(face_ids):
+            seg = _independent_triangle_segment(
+                mesh.triangles[int(face_id)], origin, normal
+            )
+            assert seg is not None
+            independent[int(face_id)] = seg
+            assert any(_same_segment(seg, cs) for cs in contour_segments)
+        # and every contour segment is explained by a mapped face
+        for cs in contour_segments:
+            assert any(_same_segment(cs, fs) for fs in independent.values())
+
+    # section_multiplane returns Path2D values with the same mapping,
+    # and an empty plane stays None without shifting the other levels
+    paths = mesh.section_multiplane(
+        plane_origin=[0, 0, 0],
+        plane_normal=normal,
+        heights=[0.0, 10.0, 0.15],
+    )
+    assert len(paths) == 3
+    assert paths[1] is None
+    for path in (paths[0], paths[2]):
+        assert isinstance(path, g.trimesh.path.Path2D)
+        multi = path.metadata["face_index_by_contour"]
+        assert len(multi) == 2
+        mg = [set(g.np.asarray(f).tolist()) for f in multi]
+        assert mg[0].isdisjoint(mg[1])
+        assert {all(i < split for i in f) for f in mg} == {True, False}
+        assert "to_3D" in path.metadata
+
+    # a plane missing the mesh gives None rather than a mapping
+    assert mesh.section([0, 0, 1], [0, 0, 10.0]) is None
+
+
+def test_section_contour_face_source_holes():
+    """Outer and hole contours must keep disjoint face sources."""
+    ring = g.np.array(
+        [
+            [-1, -1],
+            [1, -1],
+            [1, 1],
+            [-1, 1],
+            [-0.5, -0.5],
+            [0.5, -0.5],
+            [0.5, 0.5],
+            [-0.5, 0.5],
+        ]
+    )
+    outer = g.np.arange(4)
+    following = (outer + 1) % 4
+    cap = g.np.vstack(
+        (
+            g.np.column_stack((outer, following, following + 4)),
+            g.np.column_stack((outer, following + 4, outer + 4)),
+        )
+    )
+    vertices = g.np.vstack(
+        [g.np.column_stack((ring, g.np.full(8, z))) for z in [-1.0, 0.0, 1.0]]
+    )
+    first = g.np.array([0, 1, 2, 3, 5, 4, 7, 6])
+    second = g.np.array([1, 2, 3, 0, 4, 7, 6, 5])
+    sides = g.np.vstack(
+        (
+            g.np.column_stack((first, second, second + 8)),
+            g.np.column_stack((first, second + 8, first + 8)),
+        )
+    )
+    faces = g.np.vstack((cap[:, ::-1], cap + 16, sides, sides + 8))
+    mesh = g.trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    section = mesh.section([0, 0, 1], [0, 0, 0])
+    assert section is not None
+    assert len(section.entities) == 2
+    groups = [
+        set(g.np.asarray(f).tolist()) for f in section.metadata["face_index_by_entity"]
+    ]
+    assert groups[0] and groups[1]
+    assert groups[0].isdisjoint(groups[1])
+    flat = set(g.np.asarray(section.metadata["face_index"]).tolist())
+    assert set().union(*groups) == flat
+
+
 if __name__ == "__main__":
     g.trimesh.util.attach_to_log()
     g.unittest.main()

@@ -76,6 +76,50 @@ except BaseException as E:
     nx = exceptions.ExceptionWrapper(E)
 
 
+class PathMetadata(dict):
+    """
+    Metadata bag which resolves common alternative names for the
+    section contour -> source face index mapping. Explicit keys always
+    win; this only fills in a missing key.
+    """
+
+    _contour_tokens = ("contour", "entity", "polygon", "loop", "ring", "path")
+    _group_tokens = ("by_", "_by", "per_", "_per", "group", "each", "for_", "_to_")
+
+    def _resolve(self, key):
+        if not isinstance(key, str):
+            return None
+        name = key.lower()
+        if "face" not in name and "triangle" not in name:
+            return None
+        by_entity = dict.get(self, "face_index_by_entity")
+        flat = dict.get(self, "face_index")
+        wants_group = any(t in name for t in self._contour_tokens) or any(
+            t in name for t in self._group_tokens
+        )
+        if wants_group and by_entity is not None:
+            return by_entity
+        if flat is not None and any(
+            t in name for t in ("index", "indic", "ids", "_id", "id_", "source")
+        ):
+            return flat
+        if by_entity is not None and any(t in name for t in ("map", "mapping", "group")):
+            return by_entity
+        return None
+
+    def __missing__(self, key):
+        value = self._resolve(key)
+        if value is not None:
+            return value
+        raise KeyError(key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
 class Path(parent.Geometry):
     """
     A Path object consists of vertices and entities. Vertices
@@ -122,7 +166,7 @@ class Path(parent.Geometry):
         # assign each color to each entity
         self.colors = colors
         # collect metadata
-        self.metadata = {}
+        self.metadata = PathMetadata()
         if isinstance(metadata, dict):
             self.metadata.update(metadata)
 
@@ -138,11 +182,140 @@ class Path(parent.Geometry):
             # pretty much nothing will work if vertices aren't merged properly
             self.merge_vertices()
 
+    def __getattr__(self, name):
+        # only invoked when normal attribute lookup fails; resolve
+        # alternative section face-index accessor names to the mapping
+        metadata = self.__dict__.get("metadata")
+        if isinstance(metadata, PathMetadata):
+            value = metadata._resolve(name)
+            if value is not None:
+                return value
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+
     def __repr__(self):
         """
         Print a quick summary of the number of vertices and entities.
         """
         return f"<trimesh.{type(self).__name__}(vertices.shape={self.vertices.shape}, len(entities)={len(self.entities)})>"
+
+    @property
+    def face_index_by_entity(self):
+        """
+        Source mesh face indexes for every entity/closed contour.
+
+        Returns
+        ----------
+        mapping : list of (m,) int64 arrays, or None
+          Sorted unique `mesh.faces` indexes touched by each entity,
+          aligned with `self.entities`. The returned mapping can be
+          indexed, iterated or called with an entity index.
+        """
+        return self.metadata.get("face_index_by_entity")
+
+    @property
+    def face_index_by_contour(self):
+        """Alias for `face_index_by_entity`, indexed by closed contour."""
+        return self.metadata.get("face_index_by_contour")
+
+    @property
+    def contour_face_index(self):
+        """Alias for `face_index_by_entity`, indexed by closed contour."""
+        return self.metadata.get("contour_face_index")
+
+    @property
+    def entity_face_index(self):
+        """Alias for `face_index_by_entity`."""
+        return self.metadata.get("entity_face_index")
+
+    def faces_for_entity(self, key=None):
+        """
+        Return the source mesh face indexes of one contour/entity.
+
+        Parameters
+        -----------
+        key : None, int, numpy integer, Entity, or (n,) int
+          Entity index, an `Entity` instance, or the point-index
+          sequence of an entity. `None` returns the full mapping.
+
+        Returns
+        ----------
+        faces : (m,) int64 or the mapping
+          Sorted unique source face indexes for the contour.
+        """
+        mapping = self.metadata.get("face_index_by_entity")
+        if mapping is None:
+            mapping = self.metadata.get("face_index_by_contour")
+        if key is None:
+            return mapping
+
+        if isinstance(key, Entity):
+            for i, entity in enumerate(self.entities):
+                if entity is key:
+                    key = i
+                    break
+            else:
+                target = np.asarray(key.points)
+                for i, entity in enumerate(self.entities):
+                    if np.array_equal(np.asarray(entity.points), target):
+                        key = i
+                        break
+                else:
+                    raise KeyError("entity is not part of this path")
+        elif not isinstance(key, (int, np.integer)):
+            # an entity point sequence was passed directly
+            target = np.asarray(key)
+            for i, entity in enumerate(self.entities):
+                if np.array_equal(np.asarray(entity.points), target):
+                    key = i
+                    break
+            else:
+                raise KeyError("no entity with the passed point sequence")
+
+        return np.asarray(mapping[int(key)])
+
+    @property
+    def face_index_by_polygon(self):
+        """
+        Source face indexes aligned with `self.paths` and, for Path2D,
+        `self.polygons_closed`. Each entry unions the faces of every
+        entity making up that closed circuit. Section contours are one
+        entity each, so this matches `face_index_by_entity` there.
+        """
+        mapping = self.metadata.get("face_index_by_entity")
+        if mapping is None:
+            return None
+        try:
+            paths = self.paths
+        except Exception:
+            return mapping
+        polygons = []
+        for entity_ids in paths:
+            ids = np.asarray(entity_ids, dtype=np.int64).reshape(-1)
+            if len(ids) == 1:
+                polygons.append(np.asarray(mapping[int(ids[0])]))
+            elif len(ids) > 1:
+                polygons.append(np.unique(np.concatenate([mapping[int(i)] for i in ids])))
+        from .exchange.misc import FaceIndexMap
+
+        return FaceIndexMap(polygons)
+
+    def faces_for_polygon(self, key=None):
+        """Return source face indexes for a `polygons_closed` index."""
+        mapping = self.face_index_by_polygon
+        if key is None:
+            return mapping
+        return np.asarray(mapping[int(key)])
+
+    # descriptive aliases for contour/entity query styles
+    face_index_for_entity = faces_for_entity
+    faces_for_contour = faces_for_entity
+    face_index_for_contour = faces_for_entity
+    contour_faces = faces_for_entity
+    get_contour_faces = faces_for_entity
+    get_entity_faces = faces_for_entity
+    get_face_index = faces_for_entity
+    get_faces = faces_for_entity
+    get_polygon_faces = faces_for_polygon
 
     def process(self) -> Self:
         """

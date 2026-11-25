@@ -2344,7 +2344,7 @@ class Trimesh(Geometry3D):
         from .path.path import Path3D
 
         # return a single cross section in 3D
-        lines, _face_index = intersections.mesh_plane(
+        lines, face_index = intersections.mesh_plane(
             mesh=self,
             plane_normal=plane_normal,
             plane_origin=plane_origin,
@@ -2357,11 +2357,8 @@ class Trimesh(Geometry3D):
             return None
 
         # otherwise load the line segments into the keyword arguments
-        # for a Path3D object.
-        path = lines_to_path(lines)
-
-        # add the face index info into metadata
-        # path.metadata["face_index"] = face_index
+        # for a Path3D object, retaining the source face of each segment
+        path = lines_to_path(lines, index=face_index)
 
         return Path3D(**path)
 
@@ -2394,6 +2391,7 @@ class Trimesh(Geometry3D):
         """
         # turn line segments into Path2D/Path3D objects
         from .exchange.load import load_path
+        from .path.exchange.misc import lines_to_path
 
         # do a multiplane intersection
         lines, transforms, faces = intersections.mesh_multiplane(
@@ -2407,7 +2405,11 @@ class Trimesh(Geometry3D):
         paths = [None] * len(lines)
         for i, f, segments, T in zip(range(len(lines)), faces, lines, transforms):
             if len(segments) > 0:
-                paths[i] = load_path(segments, metadata={"to_3D": T, "face_index": f})
+                # assemble contours while retaining the source face index
+                # of every segment and the stable per-contour mapping
+                kwargs = lines_to_path(segments, index=f)
+                kwargs["metadata"]["to_3D"] = T
+                paths[i] = load_path(kwargs)
         return paths
 
     def slice_plane(
