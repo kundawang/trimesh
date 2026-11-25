@@ -363,6 +363,33 @@ def tsp(points, start=0):
     return traversal, distances
 
 
+def _is_row_selection(key):
+    """
+    Decide whether a ``PointCloud[key]`` access selects whole
+    rows/points and should return a new PointCloud.
+
+    Scalar integers and tuple/column indexing are treated as
+    raw-array access to preserve historical behavior.
+    """
+    if isinstance(key, (int, np.integer, slice)):
+        # slices select rows, scalars return a single raw row
+        return isinstance(key, slice)
+    if isinstance(key, tuple):
+        # could include a column selector, preserve array behavior
+        return False
+    if isinstance(key, np.ndarray):
+        if key.ndim != 1:
+            return False
+        return key.dtype == bool or np.issubdtype(key.dtype, np.integer)
+    if isinstance(key, (list, range)):
+        array = np.asarray(key)
+        if array.ndim != 1 or array.size == 0:
+            # an empty list still selects zero rows
+            return isinstance(key, list) and array.ndim == 1
+        return array.dtype == bool or np.issubdtype(array.dtype, np.integer)
+    return False
+
+
 def plot_points(points, show=True):
     """
     Plot an (n, 3) list of points using matplotlib
@@ -402,7 +429,7 @@ class PointCloud(Geometry3D):
     in a scene.
     """
 
-    def __init__(self, vertices, colors=None, metadata=None, **kwargs):
+    def __init__(self, vertices, colors=None, metadata=None, normals=None, **kwargs):
         """
         Load an array of points into a PointCloud object.
 
@@ -414,6 +441,8 @@ class PointCloud(Geometry3D):
           RGBA colors for each point
         metadata : dict or None
           Metadata about points
+        normals : (n, 3) float or None
+          Per-point normal vectors, one for each vertex.
         """
         self._data = caching.DataStore()
         self._cache = caching.Cache(self._data.__hash__)
@@ -427,14 +456,71 @@ class PointCloud(Geometry3D):
         if "vertex_colors" in kwargs and colors is None:
             colors = kwargs["vertex_colors"]
 
+        # allow the mesh-style keyword alias for per-point normals
+        if normals is None and "vertex_normals" in kwargs:
+            normals = kwargs["vertex_normals"]
+
+        # load per-point normals after vertices so the
+        # count can be validated against the vertex count
+        self.normals = normals
+
         # save visual data to vertex color object
         self.visual = VertexColor(colors=colors, obj=self)
 
     def __setitem__(self, *args, **kwargs):
         return self.vertices.__setitem__(*args, **kwargs)
 
-    def __getitem__(self, *args, **kwargs):
-        return self.vertices.__getitem__(*args, **kwargs)
+    def __getitem__(self, key):
+        # scalar and column-style indexing keeps the historical
+        # behavior of returning the underlying vertex array
+        if not _is_row_selection(key):
+            return self.vertices[key]
+
+        # row filtering returns a new PointCloud so that per-point
+        # normals and colors stay aligned with the selected points
+        index = key
+        vertices = self.vertices[index]
+
+        normals = self.normals
+        if normals is not None and len(normals) == len(self.vertices):
+            normals = normals[index]
+        else:
+            normals = None
+
+        colors = self.colors
+        if (
+            colors is not None
+            and getattr(colors, "ndim", 1) == 2
+            and len(colors) == len(self.vertices)
+            and len(colors[index]) > 0
+        ):
+            colors = colors[index]
+        else:
+            colors = None
+
+        return PointCloud(
+            vertices=vertices,
+            colors=colors,
+            normals=normals,
+            metadata=copy.deepcopy(self.metadata),
+        )
+
+    def select(self, mask):
+        """
+        Filter the point cloud with a boolean mask or integer
+        indices while keeping normals and colors aligned.
+
+        Parameters
+        -------------
+        mask : (n,) bool or (m,) int
+          Boolean mask over the vertices or integer indices.
+
+        Returns
+        ----------
+        selected : trimesh.PointCloud
+          Point cloud containing only the selected points.
+        """
+        return self[mask]
 
     @property
     def shape(self):
@@ -539,17 +625,41 @@ class PointCloud(Geometry3D):
         if self.colors is not None and len(self.colors) == len(inverse):
             self.colors = self.colors[unique]
 
+        # apply unique mask to normals so they stay aligned
+        if self.normals is not None and len(self.normals) == len(inverse):
+            self.normals = self.normals[unique]
+
     def apply_transform(self, transform):
         """
         Apply a homogeneous transformation to the PointCloud
         object in- place.
 
+        Per-point normals are transformed by the inverse
+        transpose of the linear part of the matrix and then
+        re-unitized, which gives correct directions under
+        non-uniform scale.
+
         Parameters
         --------------
-        transform : (4, 4) float
+        transform : (4, 4) float or (3, 3) float
           Homogeneous transformation to apply to PointCloud
         """
-        self.vertices = transformations.transform_points(self.vertices, matrix=transform)
+        matrix = np.asanyarray(transform, dtype=float64)
+        if matrix.shape == (3, 3):
+            full = np.eye(4, dtype=float64)
+            full[:3, :3] = matrix
+            matrix = full
+        self.vertices = transformations.transform_points(self.vertices, matrix=matrix)
+
+        if self.normals is not None:
+            linear = matrix[:3, :3]
+            # row-vector form of the inverse-transpose rule:
+            # n' = n @ inverse(M), equivalent to
+            # n_col' = inverse(M).T @ n_col
+            transformed = np.dot(self.normals, np.linalg.inv(linear))
+            # re-unitize, leaving zero/invalid rows as zero
+            self.normals = util.unitize(transformed)
+
         return self
 
     @property
@@ -650,6 +760,67 @@ class PointCloud(Geometry3D):
         if values is None or len(values) == 0:
             return self._data.data.pop("vertices", None)
         self._data["vertices"] = np.asanyarray(values, order="C", dtype=float64)
+
+    @property
+    def normals(self):
+        """
+        Per-point normal vectors.
+
+        Returns
+        ----------
+        normals : (len(self.vertices), 3) float64 or None
+          Unit-ish normal for every point, or None if no
+          normals have been assigned.
+        """
+        return self._data.get("normals")
+
+    @normals.setter
+    def normals(self, values):
+        """
+        Assign per-point normal vectors.
+
+        Parameters
+        --------------
+        values : (n, 3) float
+          One normal for every vertex. The count must match
+          the vertex count and all values must be finite.
+        """
+        if values is None:
+            self._data.data.pop("normals", None)
+            return
+
+        try:
+            array = np.asanyarray(values, dtype=float64)
+        except (TypeError, ValueError) as e:
+            raise ValueError("normals must be a numeric (n, 3) array") from e
+
+        if array.ndim == 1 and array.shape[0] == 3:
+            # a single normal vector is only unambiguous
+            # for a single point cloud
+            array = array.reshape((1, 3))
+
+        count = len(self.vertices)
+        if array.shape != (count, 3):
+            raise ValueError(
+                f"normals must have shape ({count}, 3) to match {count} vertices, got {array.shape}"
+            )
+
+        if not np.all(np.isfinite(array)):
+            raise ValueError("normals must contain only finite values (no NaN/inf)")
+
+        self._data["normals"] = np.ascontiguousarray(array, dtype=float64)
+
+    @property
+    def vertex_normals(self):
+        """
+        Alias for per-point :attr:`normals`, matching the
+        naming used by :class:`~trimesh.Trimesh`.
+        """
+        return self.normals
+
+    @vertex_normals.setter
+    def vertex_normals(self, values):
+        self.normals = values
 
     @property
     def colors(self):
@@ -768,8 +939,16 @@ class PointCloud(Geometry3D):
                 else self.colors
             )
             colors = np.vstack((self_colors, other_colors))
+
+        # preserve normals only when both clouds have them
+        normals = None
+        if self.normals is not None and other.normals is not None:
+            normals = np.vstack((self.normals, other.normals))
+
         return PointCloud(
-            vertices=np.vstack((self.vertices, other.vertices)), colors=colors
+            vertices=np.vstack((self.vertices, other.vertices)),
+            colors=colors,
+            normals=normals,
         )
 
     def estimate_normals(self, cluster_size=30) -> NDArray2D[np.float64]:
