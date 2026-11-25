@@ -21,7 +21,7 @@ class Camera:
         name : str or None
           Name for camera to be used as node name
         resolution : (2,) int
-          Pixel size in (height, width)
+          Pixel size in (width, height) i.e. (x, y)
         focal : (2,) float
           Focal length in pixels. Either pass this OR FOV
           but not both.  focal = (K[0][0], K[1][1])
@@ -351,14 +351,18 @@ def ray_pixel_coords(camera):
     z == -1.
 
     One coordinate pair will be given for each pixel as defined in
-    camera.resolution. If reshaped, the returned array corresponds
-    to pixels of the rendered image.
+    camera.resolution. The ordering matches ``resolution`` which is
+    ``(width, height)`` i.e. ``(x, y)``: reshaping the result with
+    ``xy.reshape((width, height, 2))`` gives ``xy[col, row]`` where
+    column zero is the left edge and row zero is the top edge of the
+    rendered image.
 
     Examples
     ------------
     ```python
-    xy = ray_pixel_coords(camera).reshape(
-      tuple(camera.coordinates) + (2,))
+    width, height = camera.resolution
+    xy, pixels = ray_pixel_coords(camera)
+    xy = xy.reshape((width, height, 2))
     top_left == xy[0, 0]
     bottom_right == xy[-1, -1]
     ```
@@ -373,8 +377,13 @@ def ray_pixel_coords(camera):
     xy : (n, 2) float
       x-y coordinates of intersection of each camera ray
       with the z == -1 frame
+    pixels : (n, 2) int
+      Pixel coordinate ``(column, row)`` of every ray, i.e. the
+      column counts width from left to right and the row counts
+      height from top to bottom. A ray can be written into an
+      image array as ``image[pixels[:, 1], pixels[:, 0]]``.
     """
-    # shorthand
+    # shorthand: resolution is (width, height) and fov is (fovx, fovy)
     res = camera.resolution
     half_fov = np.radians(camera.fov) / 2.0
 
@@ -388,14 +397,16 @@ def ray_pixel_coords(camera):
     right, top = right_top
     left, bottom = left_bottom
 
-    # create a grid of vectors
-    xy = util.grid_linspace(
-        bounds=[[left, top], [right, bottom]], count=camera.resolution
-    )
+    # create a grid of vectors, both grids use the camera (x, y)
+    # ordering so the entries at each index stay paired: the first
+    # axis counts columns across the width and the second axis
+    # counts rows down the height
+    xy = util.grid_linspace(bounds=[[left, top], [right, bottom]], count=res)
 
-    # create a matching array of pixel indexes for the rays
+    # create a matching array of (column, row) pixel indexes for
+    # the rays, ordered the same way as `xy`
     pixels = util.grid_linspace(
-        bounds=[[0, res[1] - 1], [res[0] - 1, 0]], count=res
+        bounds=[[0, 0], [res[0] - 1, res[1] - 1]], count=res
     ).astype(np.int64)
     assert xy.shape == pixels.shape
 
