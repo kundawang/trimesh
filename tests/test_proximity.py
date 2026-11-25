@@ -264,6 +264,29 @@ class NearestTest(g.unittest.TestCase):
         assert len(q) == 3
         assert all(len(i) == 1 for i in q)
 
+    def test_small_scale_face_interior(self):
+        # A mesh made of a tiny triangle used to return an edge point
+        # for a query that is genuinely inside the face, because the
+        # triangle closest-point test compared absolute tolerances.
+        vertices = [[0, 0, 0], [1e-4, 0, 0], [0, 1e-4, 0]]
+        points = [[3e-5, 3e-5, 0]]
+
+        mesh = g.trimesh.Trimesh(vertices=vertices, faces=[[0, 1, 2]], process=False)
+        closest, distance, _tid = mesh.nearest.on_surface(points)
+        g.np.testing.assert_allclose(closest[0], points[0], atol=1e-12)
+        assert distance[0] < 1e-12
+
+        # the same geometry at other scales must give the same result
+        base = g.np.array(vertices, dtype=g.np.float64)
+        query = g.np.array(points, dtype=g.np.float64)
+        for scale in [1e-4, 1.0, 1e4]:
+            scaled = g.trimesh.Trimesh(
+                vertices=base * scale, faces=[[0, 1, 2]], process=False
+            )
+            close, dist, _tid = scaled.nearest.on_surface(query * scale)
+            g.np.testing.assert_allclose(close[0] / scale, query[0], atol=1e-9)
+            assert dist[0] / scale < 1e-9
+
 
 if __name__ == "__main__":
     g.trimesh.util.attach_to_log()

@@ -151,6 +151,84 @@ class TrianglesTest(g.unittest.TestCase):
             closest = g.trimesh.triangles.closest_point(triangles, points)
         g.np.testing.assert_allclose(closest, expected)
 
+    def test_closest_scale_invariant(self):
+        # The classification tolerance must not depend on triangle size:
+        # a triangle with 1e-4 edges used to push an interior point onto
+        # an edge because the region tests were compared against an
+        # absolute `tol.zero`.
+        triangles = g.np.array(
+            [[[0, 0, 0], [1e-4, 0, 0], [0, 1e-4, 0]]], dtype=g.np.float64
+        )
+        # strictly interior, edge-near and vertex-near queries for the
+        # same triangle, all in the original small units
+        points = g.np.array(
+            [
+                [3e-5, 3e-5, 0],  # inside the face region
+                [1e-4 - 1e-7, 3e-5, 0],  # just inside edge AB
+                [-1e-7, 1e-7, 0.0],  # just outside vertex A
+            ]
+        )
+        # one triangle corresponds to each query point
+        triangles = g.np.broadcast_to(triangles, (len(points), 3, 3)).copy()
+
+        # reference result at the original scale
+        reference = g.trimesh.triangles.closest_point(triangles, points)
+        reference_distance = g.np.linalg.norm(points - reference, axis=1)
+
+        # the interior point must stay interior: result equals the query
+        # projected onto the z=0 plane, i.e. the point itself
+        g.np.testing.assert_allclose(reference[0], points[0], atol=1e-12)
+        assert reference_distance[0] < 1e-12
+
+        # check a wide range of uniform scales, including tiny and huge
+        for scale in [1e-8, 1e-4, 1e-2, 1.0, 1e2, 1e4, 1e8]:
+            scaled = g.trimesh.triangles.closest_point(triangles * scale, points * scale)
+            # the result should scale exactly with the triangle
+            g.np.testing.assert_allclose(
+                scaled, reference * scale, rtol=1e-9, atol=1e-12 * scale
+            )
+            # and so should the distance
+            g.np.testing.assert_allclose(
+                g.np.linalg.norm(points * scale - scaled, axis=1),
+                reference_distance * scale,
+                rtol=1e-9,
+                atol=1e-12 * scale,
+            )
+            # never produce NaN regardless of scale
+            assert g.np.isfinite(scaled).all()
+
+    def test_closest_scale_invariant_degenerate(self):
+        # Degenerate triangles must remain deterministic and NaN-free
+        # when they are very small (their extent sets a zero scale).
+        triangles = g.np.array(
+            [
+                [[0, 0, 0], [0, 0, 0], [2e-4, 0, 0]],  # AB collapsed to a point
+                [[1e-4, 2e-4, 3e-4]] * 3,  # a single point
+                [[0, 0, 0], [2e-4, 0, 0], [2e-4, 0, 0]],  # BC collapsed
+                [[0, 0, 0], [1e-4, 0, 0], [2e-4, 0, 0]],  # collinear
+            ],
+            dtype=g.np.float64,
+        )
+        points = g.np.array(
+            [
+                [1e-4, 1e-4, 0],
+                [5e-4, 2e-4, 3e-4],
+                [1e-4, 1e-4, 0],
+                [1.5e-4, 1e-4, 0],
+            ]
+        )
+        with g.np.errstate(divide="raise", invalid="raise"):
+            closest = g.trimesh.triangles.closest_point(triangles, points)
+        assert g.np.isfinite(closest).all()
+
+        # the result for a collapsed triangle is a point on its segment
+        # or itself; verify against a uniformly scaled copy is exact
+        for scale in [1e-6, 1e-4, 1.0, 1e4, 1e6]:
+            scaled = g.trimesh.triangles.closest_point(triangles * scale, points * scale)
+            g.np.testing.assert_allclose(
+                scaled, closest * scale, rtol=1e-9, atol=1e-12 * scale
+            )
+
     def test_degenerate(self):
         tri = [
             [[0, 0, 0], [1, 0, 0], [-0.5, 0, 0]],

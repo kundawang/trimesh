@@ -626,14 +626,34 @@ def closest_point(triangles, points):
     b = triangles[:, 1, :]
     c = triangles[:, 2, :]
 
-    # check if P is in vertex region outside A
+    # edge vectors from vertex A in the original units
     ab = b - a
     ac = c - a
     ap = points - a
+
+    # The region tests below compare dot products and triple products
+    # against `tol.zero`, an absolute value. Those quantities scale as
+    # length**2 and length**4 respectively, so with a fixed tolerance
+    # the classification depends on how large the triangle happens to
+    # be: an interior point of a tiny triangle can be misclassified as
+    # lying on an edge. Normalize by the triangle's own extent so all
+    # comparisons are relative and the result is scale-invariant.
+    # A fully collapsed triangle has scale zero: use 1.0 there, which
+    # leaves every vector zero and reduces the point to vertex A
+    # without introducing any division by zero.
+    scale = np.abs(np.column_stack((ab, ac))).max(axis=1)
+    scale[scale == 0.0] = 1.0
+    inverse = (1.0 / scale).reshape((-1, 1))
+
+    abn = ab * inverse
+    acn = ac * inverse
+    apn = ap * inverse
+
+    # check if P is in vertex region outside A
     # this is a faster equivalent of:
     # diagonal_dot(ab, ap)
-    d1 = np.dot(ab * ap, ones)
-    d2 = np.dot(ac * ap, ones)
+    d1 = np.dot(abn * apn, ones)
+    d2 = np.dot(acn * apn, ones)
 
     # is the point at A
     is_a = np.logical_and(d1 < tol.zero, d2 < tol.zero)
@@ -659,8 +679,9 @@ def closest_point(triangles, points):
 
     # check if P in vertex region outside B
     bp = points - b
-    d3 = np.dot(ab * bp, ones)
-    d4 = np.dot(ac * bp, ones)
+    bpn = bp * inverse
+    d3 = np.dot(abn * bpn, ones)
+    d4 = np.dot(acn * bpn, ones)
 
     # do the logic check
     is_b = (d3 > -tol.zero) & (d4 <= d3) & remain
@@ -678,8 +699,9 @@ def closest_point(triangles, points):
 
     # check if P in vertex region outside C
     cp = points - c
-    d5 = np.dot(ab * cp, ones)
-    d6 = np.dot(ac * cp, ones)
+    cpn = cp * inverse
+    d5 = np.dot(abn * cpn, ones)
+    d6 = np.dot(acn * cpn, ones)
     is_c = (d6 > -tol.zero) & (d5 <= d6) & remain
     if any(is_c):
         result[is_c] = c[is_c]
