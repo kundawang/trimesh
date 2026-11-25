@@ -2986,6 +2986,46 @@ class Trimesh(Geometry3D):
             **kwargs,
         )
 
+    def submesh_from_vertices(self, vertex_mask: ArrayLike) -> "Trimesh":
+        """
+        Return a safe subset of the mesh selected by vertex.
+
+        Faces referencing any vertex not selected are removed, the
+        retained vertices are reindexed, and vertex colors, face
+        colors, UVs, normals, attributes and caches are updated to
+        match. Unlike `update_vertices` this never collapses removed
+        indices onto vertex zero and never mutates the source mesh.
+
+        Parameters
+        ------------
+        vertex_mask : (len(self.vertices),) bool or (k,) int
+          Boolean mask of vertices to keep, or integer indices of
+          vertices to keep. Boolean masks and the corresponding
+          `np.flatnonzero(mask)` index lists return the same mesh.
+
+        Returns
+        ---------
+        submesh : Trimesh
+          New mesh containing the selected vertices and every face
+          all of whose vertices were selected. An empty selection
+          returns an empty mesh.
+
+        Examples
+        ----------
+        >>> import trimesh
+        >>> mesh = trimesh.creation.box()
+        >>> top = mesh.vertices[:, 2] > 0.0
+        >>> top_mesh = mesh.submesh_from_vertices(top)
+        >>> len(top_mesh.vertices), len(top_mesh.faces)
+        (4, 2)
+        """
+        return util.submesh_from_vertices(mesh=self, vertices=vertex_mask)
+
+    # descriptive aliases for the same safe vertex-selection entry point
+    submesh_by_vertices = submesh_from_vertices
+    vertex_submesh = submesh_from_vertices
+    select_vertices = submesh_from_vertices
+
     @cache_decorator
     def identifier(self) -> NDArray[float64]:
         """

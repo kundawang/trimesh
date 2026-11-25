@@ -619,8 +619,11 @@ def to_rgba(colors: Any, dtype: DTypeLike = np.uint8) -> NDArray:
         if dtype.kind in "iu":
             colors = colors.round()
 
-    if util.is_shape(colors, (-1, 3)):
-        # add an opaque alpha for RGB colors
+    if colors.ndim == 2 and colors.shape[1] == 3:
+        # add an opaque alpha for RGB colors. Checking the exact width
+        # also handles a zero-length RGB array `(0, 3)` without letting
+        # a zero-length RGBA array `(0, 4)` be widened to five columns
+        # via the empty-array shortcut in `util.is_shape`.
         colors = np.column_stack((colors, opaque * np.ones(len(colors))))
     elif util.is_shape(colors, (3,)):
         # if passed a single RGB color add an alpha

@@ -1767,6 +1767,122 @@ def submesh(
     return result
 
 
+def vertex_selection(mask: ArrayLike, count: Integer):
+    """
+    Normalize a vertex selection into a boolean keep-mask and the
+    inverse index map used to reindex face references.
+
+    Parameters
+    ------------
+    mask : (count,) bool or (k,) int
+      Boolean mask of vertices to keep, or integer vertex indices.
+      Integer indices are treated as a set (duplicates are ignored)
+      so that selecting with `np.flatnonzero(boolean_mask)` and
+      passing the boolean mask produce the same result.
+    count : int
+      Number of vertices in the source mesh.
+
+    Returns
+    ---------
+    keep : (count,) bool
+      Boolean mask of which original vertices are kept.
+    inverse : (count,) int64
+      Maps an original vertex index to its reindexed location.
+      Entries for removed vertices are zero; callers must first drop
+      every face that references a removed vertex so those entries
+      are never used.
+    """
+    array = np.asanyarray(mask)
+
+    if array.dtype.kind == "b":
+        if array.size == 0:
+            # a zero-length boolean selection means "select none",
+            # matching an empty integer index list
+            keep = np.zeros(count, dtype=bool)
+        elif array.shape != (count,):
+            raise IndexError(
+                f"boolean vertex mask must have shape ({count},), got {array.shape}"
+            )
+        else:
+            keep = array
+    else:
+        if array.dtype.kind in "iu" and array.ndim <= 1:
+            # integer arrays (including a bare scalar index) can be used
+            # directly; atleast_1d turns a scalar into a one-element array
+            indices = np.atleast_1d(array).astype(np.int64, copy=False)
+        else:
+            # empty lists infer as float, sets/generators expose object
+            # arrays: materialize the iterable and cast explicitly
+            try:
+                indices = np.asarray(list(mask), dtype=np.int64)
+            except (TypeError, ValueError) as exc:
+                raise IndexError(
+                    "vertex selection must be a boolean mask or integer indices"
+                ) from exc
+        if indices.ndim != 1:
+            raise IndexError("vertex indices must be a 1D array-like")
+        keep = np.zeros(count, dtype=bool)
+        # let numpy raise IndexError for out-of-range indices; negative
+        # indices follow normal numpy indexing semantics.
+        keep[indices] = True
+
+    inverse = np.zeros(count, dtype=np.int64)
+    inverse[keep] = np.arange(int(keep.sum()), dtype=np.int64)
+
+    return keep, inverse
+
+
+def submesh_from_vertices(mesh, vertices: ArrayLike):
+    """
+    Return a copy of `mesh` restricted to the selected vertices.
+
+    Every face that references an unselected vertex is dropped, and
+    the surviving vertices are reindexed from zero. This avoids the
+    degenerate faces produced by calling `update_vertices` directly,
+    whose inverse map sends removed indices to zero. Vertex colors,
+    face colors, UV coordinates, normals, per-vertex/per-face
+    attributes and caches are updated through the standard
+    `update_faces` / `update_vertices` paths. The source mesh is never
+    modified.
+
+    Parameters
+    ------------
+    mesh : Trimesh
+      Source mesh, will not be modified.
+    vertices : (len(mesh.vertices),) bool or (k,) int
+      Boolean mask of vertices to keep, or integer vertex indices.
+      An empty selection returns an empty mesh and selecting every
+      vertex returns a full independent copy.
+
+    Returns
+    ---------
+    submesh : Trimesh
+      A new mesh containing only the selected vertices and the faces
+      whose corners all reference selected vertices.
+    """
+    keep, inverse = vertex_selection(vertices, len(mesh.vertices))
+
+    # always operate on a copy so the source stays untouched
+    result = mesh.copy()
+
+    if result.is_empty:
+        return result
+
+    # drop faces touching any removed vertex FIRST: while all original
+    # vertices are still present `is_empty` is False and update_faces
+    # runs even when every face is removed.
+    if is_shape(result.faces, (-1, 3)):
+        face_mask = keep[result.faces].all(axis=1)
+        result.update_faces(face_mask)
+
+    # pass the explicit inverse so retained faces are reindexed
+    # correctly; removed indices map to zero but no surviving face
+    # references them after update_faces above.
+    result.update_vertices(keep, inverse=inverse)
+
+    return result
+
+
 def zero_pad(data: NDArray, count: Integer, right: bool = True) -> NDArray:
     """
     Parameters

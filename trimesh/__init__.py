@@ -64,7 +64,7 @@ from .scene.scene import Scene
 from .transformations import transform_points
 
 # utility functions
-from .util import unitize
+from .util import submesh_from_vertices, unitize
 from .version import __version__
 
 try:
@@ -122,6 +122,7 @@ __all__ = [
     "repair",
     "sample",
     "smoothing",
+    "submesh_from_vertices",
     "tol",
     "transform_points",
     "transformations",
