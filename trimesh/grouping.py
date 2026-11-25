@@ -21,6 +21,162 @@ except BaseException as E:
     cKDTree = exceptions.ExceptionWrapper(E)
 
 
+def _union_labels(pairs: NDArray, count: int) -> NDArray[np.int64]:
+    """
+    Label connected components of a graph given as index pairs.
+
+    Parameters
+    -------------
+    pairs : (m, 2) int
+      Undirected edges between vertex indices.
+    count : int
+      Total number of vertices.
+
+    Returns
+    -------------
+    labels : (count,) int64
+      Component label of every vertex, in order of first appearance.
+    """
+    # no edges: every vertex is its own component
+    if len(pairs) == 0:
+        return np.arange(count, dtype=np.int64)
+
+    try:
+        from scipy.sparse import coo_matrix
+        from scipy.sparse.csgraph import connected_components
+
+        graph = coo_matrix(
+            (np.ones(len(pairs), dtype=np.int8), (pairs[:, 0], pairs[:, 1])),
+            shape=(count, count),
+        )
+        _n, labels = connected_components(graph, directed=False)
+        # reorder labels by first appearance to match the keep-order semantics
+        _, inverse = np.unique(labels, return_inverse=True)
+        return inverse.astype(np.int64)
+    except Exception:
+        # pure-numpy fallback when scipy is unavailable
+        root = np.arange(count, dtype=np.int64)
+
+        def find(i: int) -> int:
+            while root[i] != i:
+                root[i] = root[root[i]]
+                i = int(root[i])
+            return i
+
+        for a, b in pairs:
+            ra, rb = find(int(a)), find(int(b))
+            if ra != rb:
+                # always point the larger root at the smaller one so labels
+                # come out in order of first appearance
+                if ra < rb:
+                    root[rb] = ra
+                else:
+                    root[ra] = rb
+
+        labels = np.fromiter((find(i) for i in range(count)), dtype=np.int64)
+        _, inverse = np.unique(labels, return_inverse=True)
+        return inverse.astype(np.int64)
+
+
+def _merge_groups_adaptive(
+    vertices: NDArray, referenced: NDArray
+) -> NDArray[np.int64]:
+    """
+    Group coincident vertices with a merge distance that follows the
+    geometry scale instead of a single absolute tolerance.
+
+    A fixed tolerance like ``tol.merge`` (1e-8) is meaningless for geometry
+    whose own size is below it -- a nanometer box collapses to a single
+    point -- and it erases small components sitting next to much larger
+    ones in an assembly. The grouping runs in two phases:
+
+    * **coincidence** -- vertices separated by only a few floating-point
+      ULPs are the same point up to round-off (e.g. regular-grid seam and
+      pole vertices, and bit-identical duplicates emitted by loaders). The
+      threshold is a multiple of ``np.spacing`` at the coordinate
+      magnitude, so it is scale-independent: tiny but real geometry, whose
+      edges are always vastly larger than a ULP, is never touched.
+    * **scale-aware merge** -- after collapsing coincident clusters, each
+      cluster representative gets a relative merge radius of ``tol.merge``
+      times its local neighborhood span (capped at unit scale). At ordinary
+      unit scale this equals the historical absolute ``tol.merge``, while
+      nanometer geometry and small assembly components keep a radius
+      proportional to their own size.
+
+    Parameters
+    -------------
+    vertices : (n, 3) float
+      All mesh vertices.
+    referenced : (n,) bool
+      Vertices actually referenced by faces.
+
+    Returns
+    -------------
+    inverse : (n,) int64
+      Group label for every vertex; unreferenced vertices get unique labels.
+    """
+    # a gap within this many float64 ULPs at the coordinate magnitude is
+    # treated as floating-point coincidence rather than real geometry
+    coincidence_ulp = 16
+
+    count = len(vertices)
+    inverse = np.arange(count, dtype=np.int64)
+
+    ref_idx = np.nonzero(referenced)[0]
+    points = vertices[ref_idx]
+    n = len(points)
+    if n <= 1:
+        return inverse
+
+    tree = cKDTree(points)
+
+    # ---- phase 1: machine-precision coincidence (scale independent)
+    coord_magnitude = max(float(np.abs(points).max()), 1.0)
+    coincidence_radius = coincidence_ulp * np.spacing(coord_magnitude)
+    near = tree.query_pairs(r=coincidence_radius, output_type="ndarray")
+    if len(near) > 0:
+        a, b = near[:, 0], near[:, 1]
+        dist = np.linalg.norm(points[a] - points[b], axis=1)
+        near = near[dist <= coincidence_radius]
+    cluster = _union_labels(near, n)
+
+    # one representative (first member) per coincidence cluster
+    rep_idx = np.unique(cluster, return_index=True)[1].astype(np.int64)
+    rep_idx.sort()
+    representatives = points[rep_idx]
+    m = len(rep_idx)
+    if m == 1:
+        inverse[ref_idx] = cluster
+        return inverse
+
+    # ---- phase 2: scale-aware merge of the cluster representatives
+    rep_tree = cKDTree(representatives)
+    spans, _ = rep_tree.query(representatives, k=min(4, m))
+    # neighborhood span is the local feature scale; cap at unit scale so
+    # ordinary-sized geometry keeps the historical absolute tolerance
+    feature = np.minimum(spans[:, -1], 1.0)
+    relative_radius = tol.merge * feature
+
+    rmax = float(max(tol.merge, relative_radius.max()))
+    pairs = rep_tree.query_pairs(r=rmax, output_type="ndarray")
+    if len(pairs) > 0:
+        a, b = pairs[:, 0], pairs[:, 1]
+        dist = np.linalg.norm(representatives[a] - representatives[b], axis=1)
+        relative_close = dist <= np.maximum(
+            relative_radius[a], relative_radius[b]
+        )
+        # the historical absolute tolerance only acts on ordinary-scale
+        # neighborhoods; on sub-unit geometry it exceeds the features
+        ordinary = (feature[a] >= 1.0) | (feature[b] >= 1.0)
+        absolute_close = ordinary & (dist <= tol.merge)
+        pairs = pairs[relative_close | absolute_close]
+
+    rep_labels = _union_labels(pairs, m)
+    inverse[ref_idx] = rep_labels[cluster]
+
+    return inverse
+
+
 def merge_vertices(
     mesh,
     merge_tex: bool | None = None,
@@ -44,7 +200,10 @@ def merge_vertices(
       If True, meshes with vertex normals will have
       vertices merged ignoring different normals
     digits_vertex : None or int
-      Number of digits to consider for vertex position
+      Number of digits to consider for vertex position. When ``None`` the
+      merge distance is scaled to the local geometry so nanometer-scale
+      meshes and small components inside larger assemblies are preserved;
+      an explicit value forces a uniform absolute quantization.
     digits_norm : int
       Number of digits to consider for unit normals
     digits_uv : int
@@ -61,9 +220,6 @@ def merge_vertices(
         digits_norm = 2
     if digits_uv is None:
         digits_uv = 4
-    if digits_vertex is None:
-        # use tol.merge if digit precision not passed
-        digits_vertex = util.decimal_to_digits(tol.merge)
 
     # if we have a ton of unreferenced vertices it will
     # make the unique_rows call super slow so cull first
@@ -74,8 +230,63 @@ def merge_vertices(
         # this is used for geometry without faces
         referenced = np.ones(len(mesh.vertices), dtype=bool)
 
-    # collect vertex attributes into sequence we can stack
-    stacked = [mesh.vertices * (10**digits_vertex)]
+    vertices = mesh.vertices
+    referenced_vertices = vertices[referenced]
+
+    # UV / normal attributes constrain grouping further: only vertices that
+    # also agree on those attributes may merge. The adaptive clustering below
+    # is purely positional, so it is only valid when positions alone decide.
+    uv_split = (
+        not merge_tex
+        and mesh.visual.defined
+        and mesh.visual.kind == "texture"
+        and mesh.visual.uv is not None
+        and len(mesh.visual.uv) == len(vertices)
+    )
+    normals = mesh._cache["vertex_normals"]
+    norm_split = (
+        not merge_norm and np.shape(normals) == vertices.shape
+    )
+
+    if digits_vertex is None and not uv_split and not norm_split:
+        try:
+            inverse = _merge_groups_adaptive(vertices, referenced)
+        except Exception:
+            # scipy is an optional dependency and cKDTree is wrapped in an
+            # ExceptionWrapper when it is unavailable: fall through to the
+            # pure-numpy integer quantization path
+            inverse = None
+        else:
+            # keep the first referenced vertex of each positional group,
+            # matching unique_rows(keep_order=True) semantics; unreferenced
+            # vertices are culled regardless
+            ref_positions = np.nonzero(referenced)[0]
+            # first occurrence (in index order) of each group label
+            _, first = np.unique(inverse[ref_positions], return_index=True)
+            keep = np.zeros(len(vertices), dtype=bool)
+            keep[ref_positions[np.sort(first)]] = True
+            mask = np.nonzero(keep)[0]
+            mesh.update_vertices(mask=mask, inverse=inverse)
+            return
+
+    if digits_vertex is None:
+        # numpy-only fallback: quantize each axis against its own extent, so
+        # a merge distance of tol.merge * extent applies per axis. Recentering
+        # first keeps the absolute mesh position out of the rounding and the
+        # quantized integers clear of the int64 range.
+        extents = np.ptp(referenced_vertices, axis=0)
+        factor = np.ones(vertices.shape[1], dtype=np.float64)
+        nonzero = np.isfinite(extents) & (extents > 0.0)
+        factor[nonzero] = 1.0 / (tol.merge * extents[nonzero])
+        positions = (vertices - referenced_vertices.min(axis=0)) * factor
+    else:
+        # an explicitly requested digit precision applies uniformly
+        positions = vertices * (10**digits_vertex)
+
+    # collect vertex attributes into sequence we can stack. Only the vertex
+    # positions are recentered and rescaled: UV coordinates and normals live
+    # in their own unit ranges and must keep their original quantization.
+    stacked = [positions]
 
     # UV texture visuals require us to update the
     # vertices and normals differently
@@ -91,7 +302,6 @@ def merge_vertices(
         stacked.append(mesh.visual.uv * (10**digits_uv))
 
     # check to see if we have vertex normals
-    normals = mesh._cache["vertex_normals"]
     if not merge_norm and np.shape(normals) == mesh.vertices.shape:
         stacked.append(normals * (10**digits_norm))
 
