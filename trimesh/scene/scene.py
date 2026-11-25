@@ -344,6 +344,40 @@ class Scene(Geometry3D):
         # every geometry is referenced
         return referenced == set(self.geometry.keys())
 
+    @property
+    def nearest(self):
+        """
+        A `trimesh.proximity.SceneProximityQuery` object for querying
+        the closest world-space surface point across every transformed
+        mesh instance in the scene.
+        """
+        from ..proximity import SceneProximityQuery
+
+        return SceneProximityQuery(self)
+
+    def closest_point(self, points: ArrayLike, **kwargs):
+        """
+        Find the closest point on any transformed mesh in the scene.
+
+        Convenience wrapper around
+        `trimesh.proximity.closest_point_scene`; returns world-space
+        closest points and distances plus the owning geometry, node and
+        source face index.
+
+        Parameters
+        ----------
+        points : (m, 3) float
+          Points in world coordinates.
+
+        Returns
+        ----------
+        result : trimesh.proximity.SceneClosestPointResult
+          `(closest, distance, geometry_name, node_name, face_index)`.
+        """
+        from ..proximity import closest_point_scene
+
+        return closest_point_scene(self, points, **kwargs)
+
     @caching.cache_decorator
     def bounds_corners(self) -> dict[str, NDArray[float64]]:
         """

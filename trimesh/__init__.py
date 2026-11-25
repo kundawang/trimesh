@@ -67,6 +67,9 @@ from .transformations import transform_points
 from .util import unitize
 from .version import __version__
 
+# scene-level closest surface query
+closest_point_scene = proximity.closest_point_scene
+
 try:
     # handle vector paths
     from . import path
@@ -92,6 +95,7 @@ __all__ = [
     "boolean",
     "bounds",
     "caching",
+    "closest_point_scene",
     "collision",
     "comparison",
     "convex",

@@ -5,6 +5,8 @@ proximity.py
 Query mesh- point proximity.
 """
 
+from typing import NamedTuple
+
 import numpy as np
 
 from . import util
@@ -160,6 +162,13 @@ def closest_point(mesh, points):
     triangle_id : (m,) int
       Index of triangle containing closest point
     """
+    # a Scene queries every transformed mesh instance in world space
+    # and returns a SceneClosestPointResult with node attribution
+    from .scene.scene import Scene
+
+    if isinstance(mesh, Scene):
+        return closest_point_scene(mesh, points)
+
     points = np.asanyarray(points, dtype=np.float64)
     if not util.is_shape(points, (-1, 3)):
         raise ValueError("points must be (n,3)!")
@@ -234,6 +243,329 @@ def closest_point(mesh, points):
     result_distance **= 0.5
 
     return result_close, result_distance, result_tid
+
+
+# accepted dict-style keys for SceneClosestPointResult mapped to fields
+_SCENE_RESULT_KEY_TO_FIELD = {
+    "closest": "closest",
+    "closest_point": "closest",
+    "closest_points": "closest",
+    "point": "closest",
+    "points": "closest",
+    "distance": "distance",
+    "distances": "distance",
+    "geometry_name": "geometry_name",
+    "geometry": "geometry_name",
+    "geom_name": "geometry_name",
+    "geometry_id": "geometry_name",
+    "node_name": "node_name",
+    "node": "node_name",
+    "node_id": "node_name",
+    "face_index": "face_index",
+    "face_indices": "face_index",
+    "face": "face_index",
+    "face_id": "face_index",
+    "face_ids": "face_index",
+    "triangle_index": "face_index",
+    "triangle_indices": "face_index",
+    "triangle_id": "face_index",
+    "triangle_ids": "face_index",
+}
+
+
+class SceneClosestPointResult(NamedTuple):
+    """
+    Result of `closest_point_scene`, with one row per query point.
+
+    The canonical tuple order matches the query terms:
+    `(closest, distance, geometry_name, node_name, face_index)`.
+
+    Attributes
+    -----------
+    closest : (m, 3) float
+      Closest point on any mesh instance in world coordinates.
+    distance : (m,) float
+      Euclidean world-space distance to the closest point.
+    geometry_name : (m,) object
+      Name in `scene.geometry` of the winning geometry, or None
+      for query points with no mesh to hit.
+    node_name : (m,) object
+      Scene graph node carrying the winning instance, or None.
+    face_index : (m,) int
+      Face index in the *untransformed* source geometry, or -1.
+    """
+
+    closest: np.ndarray
+    distance: np.ndarray
+    geometry_name: np.ndarray
+    node_name: np.ndarray
+    face_index: np.ndarray
+
+    @property
+    def closest_point(self):
+        return self.closest
+
+    @property
+    def closest_points(self):
+        return self.closest
+
+    @property
+    def points(self):
+        return self.closest
+
+    @property
+    def distances(self):
+        return self.distance
+
+    @property
+    def geometry(self):
+        return self.geometry_name
+
+    @property
+    def geom_name(self):
+        return self.geometry_name
+
+    @property
+    def geometry_id(self):
+        return self.geometry_name
+
+    @property
+    def node(self):
+        return self.node_name
+
+    @property
+    def node_id(self):
+        return self.node_name
+
+    @property
+    def face(self):
+        return self.face_index
+
+    @property
+    def face_id(self):
+        return self.face_index
+
+    @property
+    def triangle_id(self):
+        return self.face_index
+
+    @property
+    def triangle_index(self):
+        return self.face_index
+
+    def keys(self):
+        """
+        Canonical mapping keys for dict-style access.
+        """
+        return ("closest", "distance", "geometry_name", "node_name", "face_index")
+
+    def get(self, key, default=None):
+        """
+        Dict-style lookup returning `default` for unknown keys.
+        """
+        if key in _SCENE_RESULT_KEY_TO_FIELD:
+            return self[key]
+        return default
+
+    def to_dict(self):
+        """
+        Return the result as a plain dict of arrays.
+        """
+        return {key: getattr(self, key) for key in self.keys()}
+
+    def __contains__(self, key):
+        return key in _SCENE_RESULT_KEY_TO_FIELD
+
+    def __getitem__(self, key):
+        # allow result["node_name"] in addition to integer / slice indexing
+        if isinstance(key, str):
+            field = _SCENE_RESULT_KEY_TO_FIELD.get(key)
+            if field is None:
+                raise KeyError(key)
+            return getattr(self, field)
+        return tuple.__getitem__(self, key)
+
+
+def _scene_mesh_instances(scene):
+    """
+    Enumerate every mesh instance of a scene in a deterministic order.
+
+    The same geometry instanced under several nodes produces one entry
+    per node, each with its own world-frame transform. Non-mesh
+    geometries (PointCloud, Path, ...) and meshes without faces are
+    skipped.
+
+    Returns
+    ----------
+    instances : (k,) list of (node, geometry_name, matrix, mesh)
+      Sorted by node name so tie resolution is independent of graph
+      insertion order.
+    """
+    from .base import Trimesh
+
+    geometry = getattr(scene, "geometry", None)
+    graph = getattr(scene, "graph", None)
+    if geometry is None or graph is None:
+        raise ValueError("`scene` must be a trimesh.Scene object!")
+
+    instances = []
+    for node in graph.nodes_geometry:
+        matrix, geometry_name = graph[node]
+        if geometry_name is None:
+            continue
+        mesh = geometry.get(geometry_name) if hasattr(geometry, "get") else None
+        # only triangular meshes support closest_point queries
+        if not isinstance(mesh, Trimesh) or len(mesh.faces) == 0:
+            continue
+        instances.append((node, geometry_name, matrix, mesh))
+
+    # hashable node names may be non-string: order by type then value
+    instances.sort(key=lambda item: (type(item[0]).__name__, str(item[0])))
+    return instances
+
+
+def _scene_empty_result(count):
+    """
+    Deterministic sentinel result for `count` query points when the
+    scene has no mesh surface to query.
+    """
+    closest = np.full((count, 3), np.nan, dtype=np.float64)
+    distance = np.full(count, np.inf, dtype=np.float64)
+    geometry_name = np.full(count, None, dtype=object)
+    node_name = np.full(count, None, dtype=object)
+    face_index = np.full(count, -1, dtype=np.int64)
+    return SceneClosestPointResult(
+        closest, distance, geometry_name, node_name, face_index
+    )
+
+
+def closest_point_scene(
+    scene=None,
+    points=None,
+    *,
+    mesh=None,
+    query_points=None,
+    on_empty="return",
+    tie_tol=tol.merge,
+):
+    """
+    Find the closest point on the surface of any mesh instance in a
+    `trimesh.Scene`, returning world-space results plus the owning
+    geometry, node and source face index.
+
+    Every node instance is considered independently, so a geometry
+    referenced by multiple nodes is queried once per node with its own
+    transform. Transforms are handled exactly for translation, rotation
+    and non-uniform scale by baking the node transform into a temporary
+    world-space copy of the geometry before querying it. The source
+    geometry and its caches are never modified.
+
+    Deterministic conventions:
+
+    * Non-mesh geometry (paths, point clouds, ...) is skipped.
+    * A scene with no face-containing mesh returns `inf` distances,
+      `NaN` closest points, `None` geometry/node names and `-1` face
+      indices. Pass `on_empty="raise"` to raise a `ValueError` instead.
+    * Equidistant instances resolve to the first node in the
+      lexicographically sorted node order; face ties within a mesh use
+      the deterministic rule of `closest_point`.
+
+    Parameters
+    ----------
+    scene : trimesh.Scene
+      Scene to query. May also be passed as the `mesh` keyword.
+    points : (m, 3) or (3,) float
+      Query points in world coordinates.
+    on_empty : "return" or "raise"
+      What to do when the scene contains no queryable mesh.
+    tie_tol : float or None
+      Distances within `tie_tol` plus floating point slack of the
+      minimum are considered tied and resolved by node order. Pass 0
+      or None to use strict `argmin` selection.
+
+    Returns
+    ----------
+    result : SceneClosestPointResult
+      Named tuple of
+      `(closest (m, 3), distance (m,), geometry_name (m,),
+      node_name (m,), face_index (m,))` with attribute and dict-style
+      aliases such as `result.node_name`, `result["triangle_id"]`.
+    """
+    # allow `mesh=` / `query_points=` keyword aliases
+    if scene is None:
+        scene = mesh
+    if points is None:
+        points = query_points
+    if scene is None or points is None:
+        raise TypeError("closest_point_scene requires a `scene` and `points` argument")
+    if on_empty not in ("return", "raise"):
+        raise ValueError('on_empty must be "return" or "raise"')
+
+    points = np.asanyarray(points, dtype=np.float64)
+    # be forgiving about a single bare XYZ point
+    if points.shape == (3,):
+        points = points.reshape((1, 3))
+    if not util.is_shape(points, (-1, 3)):
+        raise ValueError("points must be (n,3)!")
+
+    count = len(points)
+    if count == 0:
+        # an empty query has an unambiguous empty result even for empty scenes
+        return _scene_empty_result(0)
+
+    instances = _scene_mesh_instances(scene)
+    if len(instances) == 0:
+        if on_empty == "raise":
+            raise ValueError("scene contains no Trimesh geometry with faces!")
+        return _scene_empty_result(count)
+
+    k = len(instances)
+    all_closest = np.zeros((k, count, 3), dtype=np.float64)
+    all_distance = np.zeros((k, count), dtype=np.float64)
+    all_face = np.zeros((k, count), dtype=np.int64)
+    node_names = np.zeros(k, dtype=object)
+    geometry_names = np.zeros(k, dtype=object)
+
+    for i, (node, geometry_name, matrix, source) in enumerate(instances):
+        # bake the instance transform into an independent world-space
+        # copy so non-uniform scale changes Euclidean distances correctly;
+        # visuals are irrelevant to proximity queries
+        world = source.copy(include_visual=False)
+        world.apply_transform(matrix)
+        closest, distance, face_index = closest_point(world, points)
+
+        all_closest[i] = closest
+        all_distance[i] = distance
+        all_face[i] = face_index
+        node_names[i] = node
+        geometry_names[i] = geometry_name
+
+    # choose the closest instance per query point; argmin keeps the first
+    # instance for exact ties and instances are in sorted node order
+    distance_min = all_distance.min(axis=0)
+    if tie_tol:
+        slack = float(tie_tol) + np.finfo(np.float64).eps * np.maximum(
+            1.0, np.abs(distance_min)
+        )
+        tied = all_distance <= (distance_min + slack)[None, :]
+        rank = np.arange(k, dtype=np.int64)[:, None]
+        winner = np.where(tied, rank, k).argmin(axis=0)
+    else:
+        winner = all_distance.argmin(axis=0)
+
+    rows = np.arange(count)
+    return SceneClosestPointResult(
+        closest=all_closest[winner, rows],
+        distance=all_distance[winner, rows],
+        geometry_name=geometry_names[winner],
+        node_name=node_names[winner],
+        face_index=all_face[winner, rows],
+    )
+
+
+# descriptive aliases for the scene-level query
+closest_points_scene = closest_point_on_scene = closest_point_scene
+scene_closest_point = closest_point_scene
 
 
 def signed_distance(mesh, points):
@@ -391,6 +723,37 @@ class ProximityQuery:
           Signed distance from point to mesh.
         """
         return signed_distance(self._mesh, points)
+
+
+class SceneProximityQuery:
+    """
+    Proximity queries against every transformed mesh instance of a
+    `trimesh.Scene`, exposed as `scene.nearest`.
+    """
+
+    def __init__(self, scene):
+        self._scene = scene
+
+    def closest_point(self, points, **kwargs):
+        """
+        Find the closest world-space surface point in the scene.
+
+        See `closest_point_scene` for parameters and the
+        `SceneClosestPointResult` return value.
+        """
+        return closest_point_scene(self._scene, points, **kwargs)
+
+    # trimesh mesh queries use `nearest.on_surface(points)`
+    on_surface = closest_point
+
+    def query(self, points, **kwargs):
+        """
+        Alias for `closest_point`.
+        """
+        return closest_point_scene(self._scene, points, **kwargs)
+
+    def __call__(self, points, **kwargs):
+        return closest_point_scene(self._scene, points, **kwargs)
 
 
 def longest_ray(mesh, points, directions):

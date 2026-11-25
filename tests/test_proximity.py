@@ -265,6 +265,238 @@ class NearestTest(g.unittest.TestCase):
         assert all(len(i) == 1 for i in q)
 
 
+class SceneClosestPointTest(g.unittest.TestCase):
+    @staticmethod
+    def _boxes_scene():
+        # one shared unit-box geometry instanced three times:
+        # box_a at x=0, box_b 3 units away at x=3, and a non-uniformly
+        # scaled instance above the origin
+        box = g.trimesh.creation.box()
+        scene = g.trimesh.Scene()
+        scene.add_geometry(
+            box,
+            geom_name="box",
+            node_name="box_a",
+            transform=g.trimesh.transformations.translation_matrix([0.0, 0.0, 0.0]),
+        )
+        # second node referencing the *same* geometry entry
+        scene.graph.update(
+            frame_to="box_b",
+            geometry="box",
+            matrix=g.trimesh.transformations.translation_matrix([3.0, 0.0, 0.0]),
+        )
+        scaled = g.trimesh.transformations.translation_matrix(
+            [0.0, 4.0, 0.0]
+        ) @ g.trimesh.transformations.scale_matrix(3.0)
+        scene.graph.update(frame_to="box_scaled", geometry="box", matrix=scaled)
+        return scene
+
+    def test_two_boxes_and_scaled_instance(self):
+        # requirement: hit node + analytic distances for two boxes
+        # 3 units apart and a non-uniform scaled instance
+        scene = self._boxes_scene()
+        points = g.np.array(
+            [
+                [0.75, 0.0, 0.0],  # inside the gap, nearer box_a face x=0.5
+                [2.25, 0.0, 0.0],  # nearer box_b face x=2.5
+                [2.0, 4.0, 0.0],  # scaled instance face x=1.5 (scale 3)
+            ]
+        )
+        result = g.trimesh.proximity.closest_point_scene(scene, points)
+
+        g.np.testing.assert_array_equal(
+            result.node_name, ["box_a", "box_b", "box_scaled"]
+        )
+        g.np.testing.assert_allclose(result.distance, [0.25, 0.25, 0.5], atol=1e-10)
+        g.np.testing.assert_allclose(
+            result.closest,
+            [[0.5, 0.0, 0.0], [2.5, 0.0, 0.0], [1.5, 4.0, 0.0]],
+            atol=1e-10,
+        )
+        # geometry attribution and valid source face indices
+        g.np.testing.assert_array_equal(result.geometry_name, ["box"] * 3)
+        assert result.face_index.shape == (3,)
+        assert (result.face_index >= 0).all()
+        assert (result.face_index < len(scene.geometry["box"].faces)).all()
+
+    def test_cross_check_independent_instance_queries(self):
+        # cross-check the scene query against an independent
+        # closest_point call for every baked instance
+        scene = self._boxes_scene()
+        points = g.random((40, 3)) * 9.0 - 3.0
+
+        result = scene.closest_point(points)
+
+        independent = {}
+        for node in scene.graph.nodes_geometry:
+            matrix, geometry_name = scene.graph[node]
+            baked = scene.geometry[geometry_name].copy()
+            baked.apply_transform(matrix)
+            independent[node] = (
+                geometry_name,
+                baked,
+                g.trimesh.proximity.closest_point(baked, points),
+            )
+
+        for i in range(len(points)):
+            distances = {node: data[2][1][i] for node, data in independent.items()}
+            best_distance = min(distances.values())
+            g.np.testing.assert_allclose(result.distance[i], best_distance, atol=1e-10)
+
+            node = result.node_name[i]
+            geometry_name, _baked, (close, distance, face_id) = independent[node]
+            assert result.geometry_name[i] == geometry_name
+            g.np.testing.assert_allclose(distance[i], result.distance[i], atol=1e-10)
+            g.np.testing.assert_allclose(close[i], result.closest[i], atol=1e-8)
+            assert face_id[i] == result.face_index[i]
+
+    def test_random_transforms_and_naive_reference(self):
+        # rotation, translation and non-uniform scale must produce exact
+        # world distances matching a brute-force triangle query
+        rng = g.np.random.default_rng(7)
+        meshes = [
+            g.trimesh.creation.box(extents=rng.uniform(0.5, 2.0, 3)),
+            g.trimesh.creation.icosphere(subdivisions=2, radius=0.7),
+        ]
+        scene = g.trimesh.Scene()
+        for i, mesh in enumerate(meshes):
+            affine = (
+                g.trimesh.transformations.translation_matrix(rng.uniform(-5, 5, 3))
+                @ g.trimesh.transformations.rotation_matrix(
+                    float(rng.uniform(0, g.np.pi)), rng.normal(size=3)
+                )
+                @ g.np.diag([*rng.uniform(0.4, 2.5, 3), 1.0])
+            )
+            scene.add_geometry(
+                mesh, geom_name=f"g{i}", node_name=f"n{i}", transform=affine
+            )
+        # second non-uniformly scaled instance of g0
+        affine = g.trimesh.transformations.translation_matrix(
+            [2.0, -3.0, 1.0]
+        ) @ g.np.diag([2.2, 0.6, 1.4, 1.0])
+        scene.graph.update(frame_to="n0_inst", geometry="g0", matrix=affine)
+
+        points = rng.uniform(-7, 7, (50, 3))
+        result = g.trimesh.proximity.closest_point_scene(scene, points)
+
+        naive_min = g.np.full(len(points), g.np.inf)
+        for node in scene.graph.nodes_geometry:
+            matrix, geometry_name = scene.graph[node]
+            baked = scene.geometry[geometry_name].copy()
+            baked.apply_transform(matrix)
+            _close, distance, _face = g.trimesh.proximity.closest_point_naive(
+                baked, points
+            )
+            naive_min = g.np.minimum(naive_min, distance)
+
+        g.np.testing.assert_allclose(result.distance, naive_min, atol=1e-8)
+        assert g.np.isfinite(result.distance).all()
+        assert {str(n) for n in result.node_name}.issubset({"n0", "n1", "n0_inst"})
+
+    def test_tie_is_deterministic(self):
+        # symmetric boxes one unit either side of the origin tie at d=1;
+        # lexicographic node order decides and repeat calls agree
+        box = g.trimesh.creation.box()
+        scene = g.trimesh.Scene()
+        # add in reverse name order to prove ordering is not insertion order
+        scene.add_geometry(
+            box,
+            geom_name="box",
+            node_name="right",
+            transform=g.trimesh.transformations.translation_matrix([1.5, 0, 0]),
+        )
+        scene.graph.update(
+            frame_to="left",
+            geometry="box",
+            matrix=g.trimesh.transformations.translation_matrix([-1.5, 0, 0]),
+        )
+        first = g.trimesh.proximity.closest_point_scene(scene, [[0.0, 0.0, 0.0]])
+        second = g.trimesh.proximity.closest_point_scene(scene, [[0.0, 0.0, 0.0]])
+        assert first.node_name[0] == "left"
+        g.np.testing.assert_array_equal(first.node_name, second.node_name)
+        g.np.testing.assert_allclose(first.distance, [1.0])
+
+    def test_empty_scene_convention(self):
+        scene = g.trimesh.Scene()
+        result = g.trimesh.proximity.closest_point_scene(scene, [[1.0, 2.0, 3.0]])
+        g.np.testing.assert_array_equal(result.distance, [g.np.inf])
+        assert result.node_name[0] is None
+        assert result.geometry_name[0] is None
+        g.np.testing.assert_array_equal(result.face_index, [-1])
+        assert g.np.isnan(result.closest).all()
+
+        with g.pytest.raises(ValueError):
+            g.trimesh.proximity.closest_point_scene(
+                scene, [[0.0, 0.0, 0.0]], on_empty="raise"
+            )
+
+        # an empty query batch is an empty result even on an empty scene
+        empty = g.trimesh.proximity.closest_point_scene(scene, g.np.zeros((0, 3)))
+        assert len(empty.distance) == 0
+        assert empty.closest.shape == (0, 3)
+
+    def test_non_mesh_geometry_is_skipped(self):
+        points_cloud = g.trimesh.PointCloud(g.random((20, 3)))
+        # point cloud only: same sentinel convention as an empty scene
+        cloud_scene = g.trimesh.Scene(points_cloud)
+        result = g.trimesh.proximity.closest_point_scene(cloud_scene, [[0.0, 0.0, 0.0]])
+        assert g.np.isinf(result.distance).all()
+
+        # mixed scene still finds the mesh and ignores the point cloud
+        box = g.trimesh.creation.box()
+        scene = g.trimesh.Scene()
+        scene.add_geometry(points_cloud, node_name="cloud")
+        scene.add_geometry(box, node_name="box")
+        mixed = g.trimesh.proximity.closest_point_scene(scene, [[0.6, 0.0, 0.0]])
+        g.np.testing.assert_array_equal(mixed.node_name, ["box"])
+        g.np.testing.assert_allclose(mixed.distance, [0.1], atol=1e-10)
+
+    def test_accessors_dispatch_and_aliases(self):
+        scene = self._boxes_scene()
+        points = [[0.75, 0.0, 0.0]]
+
+        via_function = g.trimesh.proximity.closest_point_scene(scene, points)
+        via_dispatch = g.trimesh.proximity.closest_point(scene, points)
+        via_nearest = scene.nearest.on_surface(points)
+        via_method = scene.closest_point(points)
+        via_toplevel = g.trimesh.closest_point_scene(scene, points)
+
+        for other in (via_dispatch, via_nearest, via_method, via_toplevel):
+            g.np.testing.assert_array_equal(other.node_name, via_function.node_name)
+            g.np.testing.assert_allclose(other.distance, via_function.distance)
+
+        # canonical five-way unpack and attribute / dict aliases
+        closest, distance, geometry, node, face = via_function
+        assert closest.shape == (1, 3)
+        g.np.testing.assert_array_equal(node, ["box_a"])
+        assert via_function["node_name"][0] == "box_a"
+        assert via_function["triangle_id"][0] == face[0]
+        assert via_function.distances[0] == distance[0]
+        assert via_function.get("geometry_name")[0] == geometry[0]
+        assert "node" in via_function
+
+    def test_single_mesh_api_and_cache_unchanged(self):
+        mesh = g.trimesh.creation.box()
+
+        # classic single-mesh API still returns exactly three arrays
+        classic = g.trimesh.proximity.closest_point(mesh, [[0.75, 0.0, 0.0]])
+        assert len(classic) == 3
+        close, distance, face_id = classic
+        assert close.shape == (1, 3)
+        assert face_id.shape == (1,)
+        g.np.testing.assert_allclose(distance, [0.25])
+
+        # let the single-mesh query populate its caches, then snapshot them
+        keys_before = set(mesh._cache.cache.keys())
+        hash_before = hash(mesh)
+
+        # running a scene query must not mutate the source mesh or its caches
+        scene = g.trimesh.Scene([mesh])
+        g.trimesh.proximity.closest_point_scene(scene, [[2.0, 0.0, 0.0]])
+        assert hash(mesh) == hash_before
+        assert set(mesh._cache.cache.keys()) == keys_before
+
+
 def test_closest_point_memory_error():
     # the exact query that got us SIGKILLed: points deep inside a closed
     # mesh have most faces as candidates so it must raise instead
