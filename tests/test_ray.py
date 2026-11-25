@@ -247,6 +247,45 @@ def test_box():
             assert g.np.isclose(p[2], mesh.bounds[:, 2]).any()
 
 
+def test_small_scale_face_ownership():
+    """https://github.com/mikedh/trimesh/issues/1338
+
+    On a small mesh the native intersector reported a hit triangle whose
+    returned point was far off the face, and `nearest.on_surface` mapped it
+    to a neighbour. Assert that at small and normal scale the hit point lies
+    on both the forward ray and its reported triangle, and that the nearest
+    surface face agrees with the ray face id.
+    """
+    # two coplanar triangles forming a square, exercised across scales
+    base_vertices = g.np.array(
+        [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]], dtype=g.np.float64
+    )
+    faces = g.np.array([[0, 1, 2], [1, 3, 2]])
+
+    for scale in [1e-6, 1e-3, 1.0, 1e3]:
+        mesh = g.trimesh.Trimesh(
+            vertices=base_vertices * scale, faces=faces, process=False
+        )
+        # ray through the interior of the first triangle
+        origin = g.np.array([[0.25, 0.25, 5.0]]) * scale
+        direction = g.np.array([[0.0, 0.0, -1.0]])
+
+        locations, _index_ray, index_tri = mesh.ray.intersects_location(
+            ray_origins=origin, ray_directions=direction
+        )
+        assert len(index_tri) == 1
+        assert index_tri[0] == 0
+
+        point = locations[0]
+        # point is on the forward ray
+        assert point[2] == 0.0
+        # point is on the reported triangle up to round-off relative to scale
+        closest = g.trimesh.triangles.closest_point(mesh.triangles[index_tri], locations)
+        assert (g.np.linalg.norm(closest - point, axis=1) / scale < 1e-9).all()
+        # nearest surface owner must be the same face
+        assert mesh.nearest.on_surface(locations)[2][0] == index_tri[0]
+
+
 def test_embree_duplicate_hits():
     """
     Test that multiple_hits=True does not get stuck in a float32 precision

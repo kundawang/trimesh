@@ -276,10 +276,18 @@ def ray_triangle_id(
     # locations are already valid plane intersections, just mask by hits
     location = location[hit]
 
-    # only return points that are forward from the origin
+    # only return points that are forward from the origin.
+    # `distance` is a physical length (dot product with the ray direction),
+    # so the cutoff must scale with the geometry: a fixed 1e-6 is larger
+    # than the entire mesh for sub-millimeter parts and either swallows
+    # genuine near-origin hits or admits backward ones.
     vector = location - ray_origins[index_ray]
     distance = util.diagonal_dot(vector, ray_directions[index_ray])
-    forward = distance > -1e-6
+    # characteristic length of the geometry, from its longest triangle edge
+    edge_vectors = triangles[:, 1:] - triangles[:, :1]
+    edge_length = np.sqrt((edge_vectors**2).sum(axis=2)).max()
+    forward_tolerance = 1e-6 * max(float(edge_length), np.finfo(np.float64).tiny)
+    forward = distance > -forward_tolerance
 
     index_tri = index_tri[forward]
     index_ray = index_ray[forward]
@@ -337,7 +345,7 @@ def ray_triangle_candidates(ray_origins, ray_directions, tree):
     return np.array(candidates, dtype=np.int64), np.array(index, dtype=np.int64)
 
 
-def ray_bounds(ray_origins, ray_directions, bounds, buffer_dist=1e-5):
+def ray_bounds(ray_origins, ray_directions, bounds, buffer_dist=None):
     """
     Given a set of rays and a bounding box for the volume of interest
     where the rays will be passing through, find the bounding boxes
@@ -348,7 +356,11 @@ def ray_bounds(ray_origins, ray_directions, bounds, buffer_dist=1e-5):
     ray_origins:      (m,3) float, ray origin points
     ray_directions:   (m,3) float, ray direction vectors
     bounds:           (2,3) bounding box (min, max)
-    buffer_dist:      float, distance to pad zero width bounding boxes
+    buffer_dist:      float, distance to pad zero width bounding boxes.
+                      If `None` it is derived from the diagonal of the
+                      volume bounds so the padding stays a fixed fraction
+                      of the geometry scale (important for very small
+                      or very large meshes).
 
     Returns
     ---------
@@ -360,6 +372,13 @@ def ray_bounds(ray_origins, ray_directions, bounds, buffer_dist=1e-5):
 
     # bounding box we are testing against
     bounds = np.asanyarray(bounds)
+
+    if buffer_dist is None:
+        # scale the broad-phase padding to the volume being queried so a
+        # fixed physical epsilon cannot dwarf a sub-millimeter mesh or
+        # become negligible for a huge one
+        diag = float(np.linalg.norm(np.ptp(bounds.reshape(2, 3), axis=0)))
+        buffer_dist = 1e-5 * max(diag, np.finfo(np.float64).tiny)
 
     # find the primary axis of the vector
     axis = np.abs(ray_directions).argmax(axis=1)

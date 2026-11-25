@@ -282,6 +282,49 @@ class NearestTest(g.unittest.TestCase):
         assert len(q) == 3
         assert all(len(i) == 1 for i in q)
 
+    def test_closest_point_small_scale(self):
+        # https://github.com/mikedh/trimesh/issues/1338
+        # Ericson region tests in `triangles.closest_point` compared
+        # physical-unit dot products against the absolute `tol.zero`.
+        # On small geometry the (length**2 / length**4) terms all fell
+        # below the tolerance and an interior point was mislabeled as an
+        # edge point, inflating the "distance to surface" and making
+        # `nearest.on_surface` return a neighbouring face. The tolerance
+        # must be relative to the triangle edge scale.
+        # A triangle and a point strictly in its interior.
+        triangle = g.np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        interior = g.np.array([0.25, 0.25, 0.0])
+
+        # the relative error must stay at round-off across many scales
+        for scale in [1e-9, 1e-6, 1e-3, 1.0, 1e3, 1e6]:
+            tri = (triangle * scale)[None]
+            point = (interior * scale)[None]
+            closest = g.trimesh.triangles.closest_point(triangles=tri, points=point)
+            distance = g.np.linalg.norm(closest - point, axis=1)
+            # an interior point's closest point is itself (up to round-off)
+            assert (distance / scale < 1e-10).all(), (scale, distance)
+
+        # a small two-face square: a ray hit on either face must keep
+        # that face as the nearest-surface owner (no neighbour swap)
+        s = 1e-4
+        square = g.trimesh.Trimesh(
+            vertices=g.np.array(
+                [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]], dtype=g.np.float64
+            )
+            * s,
+            faces=g.np.array([[0, 1, 2], [1, 3, 2]]),
+            process=False,
+        )
+        for xy, face in [([0.25, 0.25], 0), ([0.75, 0.75], 1)]:
+            origin = g.np.array([xy[0], xy[1], 1.0]) * s
+            locations, _index_ray, index_tri = square.ray.intersects_location(
+                ray_origins=origin[None],
+                ray_directions=g.np.array([[0.0, 0.0, -1.0]]),
+            )
+            assert index_tri[0] == face
+            nearest_face = square.nearest.on_surface(locations)[2]
+            assert nearest_face[0] == face
+
 
 if __name__ == "__main__":
     g.trimesh.util.attach_to_log()
