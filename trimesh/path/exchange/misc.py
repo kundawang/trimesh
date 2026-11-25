@@ -178,15 +178,20 @@ def faces_to_path(mesh, face_ids=None, **kwargs):
     kwargs : dict
       Kwargs for Path3D constructor
     """
+    # edges in face-winding order, aligned row-for-row with edges_sorted
+    edges_directed = mesh.edges
     if face_ids is None:
-        edges = mesh.edges_sorted
+        edges_sorted = mesh.edges_sorted
     else:
         # take advantage of edge ordering to index as single row
-        edges = mesh.edges_sorted.reshape((-1, 6))[face_ids].reshape((-1, 2))
-    # an edge which occurs onely once is on the boundary
-    unique_edges = grouping.group_rows(edges, require_count=1)
+        edges_directed = edges_directed.reshape((-1, 3, 2))[face_ids].reshape((-1, 2))
+        edges_sorted = np.sort(edges_directed, axis=1)
+    # an edge which occurs only once is on the boundary
+    unique_edges = grouping.group_rows(edges_sorted, require_count=1)
+    # keep the direction of the boundary edge from its source face
+    boundary_edges = edges_directed[unique_edges]
     # add edges and vertices to kwargs
-    kwargs.update(edges_to_path(edges=edges[unique_edges], vertices=mesh.vertices))
+    kwargs.update(edges_to_path(edges=boundary_edges, vertices=mesh.vertices))
 
     return kwargs
 
@@ -208,14 +213,11 @@ def edges_to_path(edges: ArrayLike, vertices: ArrayLike, **kwargs) -> dict:
     kwargs : dict
       Kwargs for Path constructor
     """
-    # sequence of ordered traversals
-    dfs = graph.traversals(edges, mode="dfs")
-    # make sure every consecutive index in DFS
-    # traversal is an edge in the source edge list
-    dfs_connected = graph.fill_traversals(dfs, edges=edges)
-    # kwargs for Path constructor
+    # assemble edges directly into ordered traversals, consuming every
+    # edge exactly once and keeping loops separate at shared vertices
+    ordered = graph.edge_traversals(edges)
     # turn traversals into Line objects
-    lines = [Line(d) for d in dfs_connected]
+    lines = [Line(d) for d in ordered]
 
     kwargs.update({"entities": lines, "vertices": vertices, "process": False})
     return kwargs

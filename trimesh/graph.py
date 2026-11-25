@@ -586,6 +586,131 @@ def _split_traversal(traversal: NDArray, edges_tree) -> list[NDArray]:
     return split
 
 
+def edge_traversals(edges: ArrayLike) -> list[NDArray[int64]]:
+    """
+    Assemble an ``(n, 2)`` list of edges into ordered node traversals by
+    following edge adjacency directly.
+
+    Every input edge is consumed exactly once and every consecutive pair
+    of nodes in a returned traversal is guaranteed to be an edge in the
+    input. Open chains start at a degree-one node, and cycles are closed by
+    repeating their first node. A walk that revisits a branching node is
+    split at the revisit into separate simple cycles, so loops which only
+    share a single vertex are not merged or fragmented.
+
+    The column order of ``edges`` gives the preferred direction: when
+    there is a choice, an edge stored as ``(node, other)`` is taken before
+    one stored as ``(other, node)``.
+
+    Parameters
+    ------------
+    edges : (n, 2) int
+      Pairs of connected node indexes
+
+    Returns
+    -----------
+    traversals : (m,) list of (p,) int64
+      Ordered node traversals covering every edge exactly once
+    """
+    edges = np.asarray(edges, dtype=np.int64)
+    if len(edges) == 0:
+        return []
+
+    node_count = int(edges.max()) + 1
+    # incident edge ids split by stored direction so the source
+    # orientation can be preferred when continuing a traversal
+    outgoing = [[] for _ in range(node_count)]
+    incoming = [[] for _ in range(node_count)]
+    for edge_id, (a, b) in enumerate(edges):
+        a, b = int(a), int(b)
+        outgoing[a].append(edge_id)
+        incoming[b].append(edge_id)
+
+    used = np.zeros(len(edges), dtype=bool)
+    out_pointer = [0] * node_count
+    in_pointer = [0] * node_count
+
+    def next_edge(node):
+        # first consume an unused edge stored node -> other
+        items = outgoing[node]
+        k = out_pointer[node]
+        while k < len(items) and used[items[k]]:
+            k += 1
+        if k < len(items):
+            edge_id = items[k]
+            out_pointer[node] = k + 1
+            return edge_id
+        out_pointer[node] = k
+        # otherwise take an edge stored other -> node and traverse it backwards
+        items = incoming[node]
+        k = in_pointer[node]
+        while k < len(items) and used[items[k]]:
+            k += 1
+        if k < len(items):
+            edge_id = items[k]
+            in_pointer[node] = k + 1
+            return edge_id
+        in_pointer[node] = k
+        return None
+
+    def walk(start, first_edge):
+        used[first_edge] = True
+        nodes = [start]
+        a, b = (int(i) for i in edges[first_edge])
+        node = b if a == start else a
+        nodes.append(node)
+        while True:
+            edge_id = next_edge(node)
+            if edge_id is None:
+                break
+            used[edge_id] = True
+            a, b = (int(i) for i in edges[edge_id])
+            node = b if a == node else a
+            nodes.append(node)
+        return nodes
+
+    traversals = []
+    # start with degree-one nodes so an open chain is one traversal
+    degree = np.bincount(edges.ravel(), minlength=node_count)
+    for node in np.nonzero(degree == 1)[0]:
+        incident = outgoing[node] if len(outgoing[node]) > 0 else incoming[node]
+        edge_id = incident[0]
+        if not used[edge_id]:
+            traversals.append(walk(int(node), edge_id))
+
+    # consume any remaining edges in source order, preserving their direction
+    for edge_id in range(len(edges)):
+        if not used[edge_id]:
+            traversals.append(walk(int(edges[edge_id, 0]), edge_id))
+
+    # split walks at repeated nodes into simple cycles and a residual path.
+    # `stack` stays node-simple and `position` maps its nodes to indices,
+    # making the decomposition linear in the length of the walks.
+    paths = []
+    for nodes in traversals:
+        stack = []
+        position = {}
+        for node in nodes:
+            if node not in position:
+                position[node] = len(stack)
+                stack.append(node)
+                continue
+
+            index = position[node]
+            paths.append(np.asarray(stack[index:] + [node], dtype=np.int64))
+            # drop the extracted suffix but keep the join node `node`
+            for removed in stack[index + 1 :]:
+                del position[removed]
+            del stack[index + 1 :]
+
+        if len(stack) > 1:
+            paths.append(np.asarray(stack, dtype=np.int64))
+
+    # stable ordering independent of which cycle was extracted first
+    paths.sort(key=lambda path: (int(path.min()), int(path[0]), len(path)))
+    return paths
+
+
 def fill_traversals(traversals: Sequence, edges: ArrayLike) -> Sequence | NDArray:
     """
     Convert a traversal of a list of edges into a sequence of
@@ -605,32 +730,15 @@ def fill_traversals(traversals: Sequence, edges: ArrayLike) -> Sequence | NDArra
        Node indexes of connected traversals
     """
     # make sure edges are correct type
-    edges = np.sort(edges, axis=1)
-    edges_tree = cKDTree(edges)
+    edges = np.sort(np.asarray(edges, dtype=np.int64), axis=1)
 
     # if there are no traversals just return edges
     if len(traversals) == 0:
         return edges.copy()
 
-    splits = []
-    for nodes in traversals:
-        # split traversals to remove edges that don't actually exist
-        splits.extend(_split_traversal(traversal=nodes, edges_tree=edges_tree))
-
-    # turn the split traversals back into (n, 2) edges
-    included = util.vstack_empty([np.column_stack((i[:-1], i[1:])) for i in splits])
-    if len(included) > 0:
-        # sort included edges in place
-        included.sort(axis=1)
-        # make sure any edges not included in split traversals
-        # are just added as a length 2 traversal
-        splits.extend(grouping.boolean_rows(edges, included, operation=np.setdiff1d))
-    else:
-        # no edges were included, so our filled traversal
-        # is just the original edges copied over
-        splits = edges.copy()
-
-    return splits
+    # assemble the source edges directly so every edge is included exactly
+    # once and loops sharing only a vertex are not fragmented by DFS jumps
+    return edge_traversals(edges)
 
 
 def traversals(edges, mode="bfs"):
