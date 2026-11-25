@@ -128,6 +128,146 @@ def test_project_multi():
         assert g.np.isclose(proj.area, 2.0)
 
 
+def test_silhouette_box():
+    # a closed box has a clear outer contour from above even though
+    # its topological outline is empty
+    mesh = g.trimesh.creation.box()
+    assert len(mesh.outline().entities) == 0
+
+    path = mesh.silhouette(direction=[0, 0, 1])
+
+    # one ordered closed exterior curve with no holes or interior edges
+    assert len(path.entities) == 1
+    assert path.entities[0].closed
+    assert len(path.root) == 1
+    polygon = path.polygons_full[0]
+    assert len(polygon.interiors) == 0
+
+    # analytic check: unit box seen from the top is a unit square
+    assert g.np.isclose(path.area, 1.0)
+    coords = g.np.array(polygon.exterior.coords)
+    assert g.np.allclose(coords.min(axis=0), -0.5)
+    assert g.np.allclose(coords.max(axis=0), 0.5)
+
+
+def test_silhouette_overlap():
+    # two overlapping boxes must merge into the projected union rather
+    # than producing two sets of overlapping edges
+    mesh = g.trimesh.creation.box() + g.trimesh.creation.box().apply_translation(
+        [0.5, 0, 0]
+    )
+    path = mesh.silhouette(direction=[0, 0, 1])
+
+    assert len(path.root) == 1
+    assert g.np.isclose(path.area, 1.5)
+
+    # disjoint boxes stay separate while still sharing no duplicate edges
+    disjoint = g.trimesh.creation.box() + g.trimesh.creation.box().apply_translation(
+        [3, 0, 0]
+    )
+    apart = disjoint.silhouette(direction=[0, 0, 1])
+    assert len(apart.root) == 2
+    assert g.np.isclose(apart.area, 2.0)
+
+    # boxes sharing an edge union cleanly as well
+    touching = g.trimesh.creation.box() + g.trimesh.creation.box().apply_translation(
+        [1, 0, 0]
+    )
+    joined = touching.silhouette(direction=[0, 0, 1])
+    assert len(joined.root) == 1
+    assert g.np.isclose(joined.area, 2.0)
+
+
+def test_silhouette_hole():
+    # a torus seen along its axis keeps one true interior hole
+    mesh = g.trimesh.creation.torus(major_radius=1.0, minor_radius=0.5)
+    path = mesh.silhouette(direction=[0, 0, 1])
+    polygon = path.polygons_full[0]
+
+    assert len(polygon.interiors) == 1
+    expected = g.np.pi * (1.5**2 - 0.5**2)
+    assert g.np.isclose(path.area, expected, atol=0.05)
+
+
+def test_silhouette_concave():
+    # a concave L-shaped footprint is recovered as a single outer contour
+    footprint = g.Polygon([(0, 0), (2, 0), (2, 1), (1, 1), (1, 2), (0, 2)])
+    engines = [k for k, exists in g.trimesh.creation._engines if exists]
+    if len(engines) == 0:
+        g.pytest.skip("no polygon triangulation engine available")
+    mesh = g.trimesh.creation.extrude_polygon(
+        footprint, height=1.0, engine=engines[0]
+    )
+    path = mesh.silhouette(direction=[0, 0, 1])
+
+    assert len(path.root) == 1
+    assert g.np.isclose(path.area, footprint.area)
+
+
+def test_silhouette_backface():
+    # a single triangle is visible from its front and culled from its back
+    mesh = g.trimesh.Trimesh(
+        vertices=[[0, 0, 0], [1, 0, 0], [0, 1, 0]], faces=[[0, 1, 2]]
+    )
+    normal = mesh.face_normals[0]
+
+    assert len(mesh.silhouette(direction=-normal).entities) == 1
+    assert g.np.isclose(mesh.silhouette(direction=-normal).area, 0.5)
+    # looking along the face normal is a back face
+    assert len(mesh.silhouette(direction=normal).entities) == 0
+    # an edge-on view has no projected area either
+    assert len(mesh.silhouette(direction=[1, 0, 0]).entities) == 0
+
+
+def test_silhouette_empty():
+    # empty meshes return a stable empty path instead of raising
+    path = g.trimesh.Trimesh().silhouette(direction=[0, 0, 1])
+    assert len(path.entities) == 0
+    assert len(path.vertices) == 0
+
+
+def test_silhouette_basis():
+    mesh = g.trimesh.creation.box()
+
+    # a swapped orthonormal basis rotates the 2D frame, not the square
+    polygon, _to_2D = g.trimesh.path.polygons.silhouette(
+        mesh, direction=[0, 0, 1], basis=[[0, 1, 0.0], [-1, 0, 0.0]]
+    )
+    coords = g.np.array(polygon.exterior.coords)
+    assert g.np.allclose(coords.min(axis=0), -0.5)
+    assert g.np.allclose(coords.max(axis=0), 0.5)
+
+    # the path stores the inverse transform that lifts it back to 3D
+    path = mesh.silhouette(direction=[0, 0, 1], basis=[[0, 1, 0.0], [-1, 0, 0.0]])
+    lifted = path.to_3D()
+    assert g.np.allclose(lifted.vertices[:, 2], 0.0)
+
+    # invalid bases are rejected
+    with g.pytest.raises(ValueError):
+        g.trimesh.path.polygons.silhouette(
+            mesh, direction=[0, 0, 1], basis=[[1, 0, 0.0], [1, 0, 0.0]]
+        )
+    with g.pytest.raises(ValueError):
+        g.trimesh.path.polygons.silhouette(
+            mesh, direction=[0, 0, 1], basis=g.np.eye(3)
+        )
+    with g.pytest.raises(ValueError):
+        g.trimesh.path.polygons.silhouette(
+            mesh, direction=[0, 0, 1], basis=[[1, 0, 0.0], [0, 1, 1.0]]
+        )
+
+
+def test_silhouette_sphere():
+    # random views of a tessellated sphere all give one boundary with no
+    # interior edges and an area close to the analytic projected area
+    mesh = g.trimesh.creation.icosphere(subdivisions=4)
+    for direction in g.random((20, 3)):
+        path = mesh.silhouette(direction=direction)
+        assert len(path.entities) == 1
+        assert len(path.polygons_full[0].interiors) == 0
+        assert g.np.isclose(path.area, g.np.pi, atol=0.02)
+
+
 def test_second_moment():
     def rectangle(extents):
         # return the boundary of an origin-centered

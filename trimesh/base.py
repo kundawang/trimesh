@@ -2837,6 +2837,58 @@ class Trimesh(Geometry3D):
             return Path2D()
         return load_path(projection)
 
+    def silhouette(
+        self,
+        direction: ArrayLike,
+        basis: ArrayLike | None = None,
+        origin: ArrayLike | None = None,
+        tol_dot: float = 1e-10,
+    ) -> Path2D:
+        """
+        Extract the visible silhouette of the mesh from an orthographic view.
+
+        Unlike `outline`, which returns the topological boundary edges and
+        is empty for watertight meshes, this projects the front-facing
+        triangles onto a plane and unions them, so occluded interior edges
+        and back-facing edges are excluded. The result is the ordered outer
+        boundary of the visible projection with any true holes attached;
+        overlapping objects are merged into a single projected union.
+
+        Parameters
+        ------------
+        direction : (3,) float
+          View direction the camera looks along.
+        basis : None or (2, 3) float
+          Two orthonormal projection axes perpendicular to `direction`,
+          used as the 2D coordinate basis. If None a stable basis is
+          chosen automatically.
+        origin : None or (3,) float
+          Point on the projection plane used as the 2D origin.
+        tol_dot : float
+          Tolerance for discarding triangles seen edge-on.
+
+        Returns
+        ----------
+        path : trimesh.path.Path2D
+          Closed silhouette curves in the 2D projection frame. Empty for
+          an empty mesh or a mesh seen exactly edge-on. The inverse
+          projection transform is stored in `path.metadata['to_3D']`.
+        """
+        from .exchange.load import load_path
+        from .path import Path2D
+        from .path.polygons import silhouette as silhouette_polygon
+
+        polygon, to_2D = silhouette_polygon(
+            mesh=self,
+            direction=direction,
+            basis=basis,
+            origin=origin,
+            tol_dot=tol_dot,
+        )
+        if polygon is None:
+            return Path2D()
+        return load_path(polygon, metadata={"to_3D": np.linalg.inv(to_2D)})
+
     @cache_decorator
     def area(self) -> float64:
         """

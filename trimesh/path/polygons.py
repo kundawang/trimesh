@@ -903,6 +903,119 @@ def projected(
         return reduced.buffer(padding).buffer(-padding)
 
 
+def silhouette(
+    mesh,
+    direction,
+    basis=None,
+    origin=None,
+    tol_dot: float = 1e-10,
+):
+    """
+    Extract the visible silhouette of a mesh from an orthographic view.
+
+    Unlike `projected` this always discards back-facing triangles, so the
+    returned region is the union of what a camera looking along `direction`
+    actually sees: an ordered outer boundary plus any true holes. Occluded
+    interior edges and edges on the back of the mesh never reach the result.
+    Overlapping or touching geometry is merged into a single region rather
+    than producing duplicate overlapping edges.
+
+    Parameters
+    ------------
+    mesh : trimesh.Trimesh
+      Source geometry.
+    direction : (3,) float
+      View direction the camera looks along. Triangles facing the camera
+      (face normal pointing against this direction) are the front faces.
+    basis : None or (2, 3) float
+      Two orthonormal vectors defining the 2D projection axes, i.e. the
+      rows of the mapping from 3D points to 2D coordinates. They must be
+      perpendicular to `direction`. If None an arbitrary stable basis is
+      chosen with `geometry.plane_transform`.
+    origin : None or (3,) float
+      Point on the projection plane, used as the 2D origin. If None the
+      world origin is used.
+    tol_dot : float
+      Tolerance for discarding triangles seen edge-on.
+
+    Returns
+    ---------
+    silhouette : shapely.geometry.Polygon or shapely.geometry.MultiPolygon or None
+      Union of the projected front faces with holes preserved, or None
+      for an empty mesh or a mesh seen exactly edge-on.
+    to_2D : (4, 4) float
+      Transform mapping the mesh frame into the 2D frame (the inverse is
+      stored as `to_3D` by the `Trimesh.silhouette` path method).
+    """
+    # an empty or vertex-only mesh has no silhouette
+    if len(mesh.faces) == 0:
+        return None, np.eye(4)
+
+    # unitize the view direction
+    direction = np.asanyarray(direction, dtype=np.float64)
+    norm = np.linalg.norm(direction)
+    if norm <= tol.zero:
+        raise ValueError("`direction` must be a non-zero vector")
+    direction = direction / norm
+
+    if basis is None:
+        # pick an arbitrary stable frame around the view direction
+        to_2D = geometry.plane_transform(origin=origin, normal=direction)
+    else:
+        basis = np.asanyarray(basis, dtype=np.float64)
+        if basis.shape != (2, 3):
+            raise ValueError("`basis` must be a (2, 3) array of 3D vectors")
+        rows = basis / np.linalg.norm(basis, axis=1).reshape((-1, 1))
+        if not np.allclose(np.dot(rows, rows.T), np.eye(2), atol=1e-8):
+            raise ValueError("`basis` rows must be orthonormal")
+        if not np.allclose(np.dot(rows, direction), 0.0, atol=1e-8):
+            raise ValueError("`basis` rows must be perpendicular to `direction`")
+        # rows map 3D points onto the 2D axes and direction maps onto +Z
+        to_2D = np.eye(4)
+        to_2D[:3, :3] = np.vstack((rows, direction))
+        if origin is not None:
+            to_2D[:3, 3] = -np.dot(to_2D[:3, :3], np.asanyarray(origin))
+
+    # only triangles facing the camera contribute to the visible silhouette
+    front = np.dot(mesh.face_normals, direction) < -tol_dot
+    if not front.any():
+        # nothing faces the camera: the mesh is seen edge-on or backwards
+        return None, to_2D
+
+    # keep adjacency between front faces only, so occluded interior edges
+    # shared by two front faces are dropped and boundary edges survive
+    adjacency_check = front[mesh.face_adjacency].all(axis=1)
+    adjacency = mesh.face_adjacency[adjacency_check]
+
+    # project the vertices into the 2D frame and drop the zero Z coordinate
+    vertices_2D = transform_points(mesh.vertices, to_2D)[:, :2]
+
+    # group connected front faces, each component forms boundary polygons
+    face_groups = graph.connected_components(adjacency, nodes=np.nonzero(front)[0])
+
+    # reshape edges into one row of six indices per face
+    edges = mesh.edges_sorted.reshape((-1, 6))
+
+    polygons = []
+    for faces in face_groups:
+        # index edges by face then shape back to individual edges
+        edge = edges[faces].reshape((-1, 2))
+        # edges that occur only once are on the component boundary
+        group = grouping.group_rows(edge, require_count=1)
+        # turn each region into polygons (holes attached via enclosure)
+        polygons.extend(edges_to_polygons(edges=edge[group], vertices=vertices_2D))
+
+    if len(polygons) == 0:
+        return None, to_2D
+    if len(polygons) == 1:
+        return polygons[0], to_2D
+
+    # merge overlapping and touching components into the projected union:
+    # two overlapping objects become one silhouette, not doubled edges
+    reduced = reduce_cascade(lambda a, b: a.union(b), polygons)
+    return reduced, to_2D
+
+
 def second_moments(polygon: Polygon, return_centered=False):
     """
     Calculate the second moments of area of a polygon
